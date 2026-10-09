@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Android `GameView`/`SplitGameView` draw with 4x MSAA, like iOS, macOS and the browser already do,
+  falling back to no antialiasing on a GPU that offers no multisample config. Before, every edge on
+  Android was aliased, and badly so when `GameViewOptions` scales the buffer up to a large screen.
+
 ## 0.1.0-alpha04 — smooth by default, tilt steering (Maven Central, 28 September 2026)
 
 - `GameViewOptions` on `GameView`/`SplitGameView`, with the source game's measured defaults:

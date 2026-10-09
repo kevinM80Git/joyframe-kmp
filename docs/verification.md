@@ -1,5 +1,18 @@
 # Verification
 
+## Unreleased — Android 4x MSAA
+
+Checked on 9 October 2026, macOS / JDK 17:
+
+- 56 desktop tests (library and sample) passed; the library compiled for desktop, Android, Wasm and
+  iOS simulator.
+- Fire TV Stick (AFTSSS, Fire OS 7.7 / Android 9, MediaTek MT8695 with PowerVR GE8300), in a
+  Joyframe game drawing a 1600x900 buffer for a 1080p TV. The device granted the 4x config. Presented
+  frames read from SurfaceFlinger held 30.0 fps at a 30 fps cap, early and 75 s into a round, the same
+  as without MSAA, and screenshots showed smooth edges where they had been stair-stepped. That run used
+  an app-side GLSurfaceView with this same config chooser around Joyframe's renderer; the library
+  build with the change compiled but has not itself been run on the device.
+
 ## Alpha04 — smooth-by-default views and tilt
 
 - **Maven Central:** released through the GitHub release workflow (signed on a macOS runner;
