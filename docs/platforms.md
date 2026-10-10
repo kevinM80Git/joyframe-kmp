@@ -3,7 +3,7 @@
 | Platform | Rendering | Controller | Audio |
 | --- | --- | --- | --- |
 | Desktop JVM | OpenGL 3.3 AWT; macOS 4.1 Core offscreen | GLFW on Windows/Linux; GameController via JNA on macOS | Java Sound; macOS system OpenAL |
-| Android API 26+ | GLES3 surface | Forward Activity key/motion events, per device | SoundPool and an optional MediaPlayer loop |
+| Android API 26+ | GLES3 surface, 4x MSAA | Forward Activity key/motion events, per device | SoundPool and an optional MediaPlayer loop |
 | iOS | Metal, MTKView | Every extended GameController | AVAudioPlayer voices |
 | Browser Wasm | WebGL2 DOM canvas | Browser Gamepad API | Web Audio; user gesture required |
 
@@ -94,7 +94,9 @@ each pane. The two-pane split follows the long edge (side by side in landscape).
 
 On Android the GL thread runs continuously and draws the newest frame composition published,
 waiting up to 50 ms for a new one, so composition never pumps the renderer. The surface buffer is
-sized from `GameViewOptions` and upscaled by the compositor; touch stays at full resolution.
+sized from `GameViewOptions` and upscaled by the compositor; touch stays at full resolution. The
+surface asks for a 4x multisample config, as the other targets draw, and logs a warning and draws
+without antialiasing on a GPU that has none.
 While a view is on screen it asks for the panel's 60 Hz mode and sustained performance mode where
 supported, and restores both when it leaves. Turn these off with the options if your game owns them.
 

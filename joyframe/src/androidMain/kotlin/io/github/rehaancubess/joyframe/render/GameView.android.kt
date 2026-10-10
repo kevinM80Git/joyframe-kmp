@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.opengl.GLSurfaceView
 import android.os.PowerManager
+import android.util.Log
 import android.view.View
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -15,7 +16,9 @@ import io.github.rehaancubess.joyframe.render.gl.*
 import io.github.rehaancubess.joyframe.render.gpu.GpuSceneFrame
 import io.github.rehaancubess.joyframe.render.gpu.PackedColor
 import java.util.concurrent.locks.ReentrantLock
+import javax.microedition.khronos.egl.EGL10
 import javax.microedition.khronos.egl.EGLConfig
+import javax.microedition.khronos.egl.EGLDisplay
 import javax.microedition.khronos.opengles.GL10
 import kotlin.concurrent.withLock
 import kotlin.math.abs
@@ -64,6 +67,7 @@ private class SceneSurface(context: Context, private val renderer: SceneRenderer
 
     init {
         setEGLContextClientVersion(3)
+        setEGLConfigChooser(MultisampleConfigChooser(MSAA_SAMPLES))
         setRenderer(renderer)
         renderMode = RENDERMODE_CONTINUOUSLY
     }
@@ -79,6 +83,39 @@ private class SceneSurface(context: Context, private val renderer: SceneRenderer
         val (w, h) = options.renderSize(width, height)
         holder.setFixedSize(w, h)
     }
+}
+
+/**
+ * 4x MSAA, as the other targets draw (iOS `sampleCount`, the macOS offscreen renderbuffers, the
+ * browser's `antialias`). GLSurfaceView's default config has no sample buffers, so without this every
+ * edge is a staircase, and a buffer scaled by [GameViewOptions] stretches it further. On a Fire TV
+ * Stick (PowerVR GE8300) drawing 1600x900 for a 1080p TV, this config removed the jagged edges and
+ * still held 30 fps (see docs/verification.md).
+ */
+private const val MSAA_SAMPLES = 4
+
+/** RGB888 with a 16-bit depth buffer, as GLSurfaceView's default, plus [samples]x MSAA when the GPU offers it. */
+private class MultisampleConfigChooser(private val samples: Int) : GLSurfaceView.EGLConfigChooser {
+    override fun chooseConfig(egl: EGL10, display: EGLDisplay): EGLConfig {
+        if (samples > 1) {
+            first(egl, display, intArrayOf(EGL10.EGL_SAMPLE_BUFFERS, 1, EGL10.EGL_SAMPLES, samples))?.let { return it }
+            Log.w("Joyframe", "No ${samples}x MSAA config; drawing without antialiasing")
+        }
+        return checkNotNull(first(egl, display, intArrayOf())) { "No OpenGL ES 3 config" }
+    }
+
+    private fun first(egl: EGL10, display: EGLDisplay, extra: IntArray): EGLConfig? {
+        val attributes = intArrayOf(
+            EGL10.EGL_RED_SIZE, 8, EGL10.EGL_GREEN_SIZE, 8, EGL10.EGL_BLUE_SIZE, 8,
+            EGL10.EGL_DEPTH_SIZE, 16, EGL10.EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        ) + extra + EGL10.EGL_NONE
+        val configs = arrayOfNulls<EGLConfig>(1)
+        val count = IntArray(1)
+        if (!egl.eglChooseConfig(display, attributes, configs, 1, count) || count[0] == 0) return null
+        return configs[0]
+    }
+
+    private companion object { const val EGL_OPENGL_ES3_BIT = 0x40 }
 }
 
 private class SceneRenderer(initial: List<GpuSceneFrame>) : GLSurfaceView.Renderer {
