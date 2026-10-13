@@ -175,13 +175,16 @@ private class SceneRenderer(initial: List<GpuSceneFrame>) : GLSurfaceView.Render
     private companion object { const val MAX_WAIT_NANOS = 50_000_000L }
 }
 
-/** Asks for the panel's own 60 Hz mode while the view is on screen; panels without one are left alone. */
+/** Asks for the panel's own 60 Hz mode while the view is on screen; panels already near 60 Hz, or without such a mode, are left alone. */
 private object SixtyHz {
     fun hold(view: View): (() -> Unit)? {
         val window = view.context.findActivity()?.window ?: return null
         @Suppress("DEPRECATION")
         val display = view.display ?: window.windowManager.defaultDisplay ?: return null
         val current = display.mode
+        // Already about 60 Hz, as a TV at 59.94 is: switching to an exact 60 makes the TV re-sync over
+        // HDMI and show black for a second or two.
+        if (abs(current.refreshRate - 60f) < 1f) return null
         val target = display.supportedModes
             .filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
             .minByOrNull { abs(it.refreshRate - 60f) }
