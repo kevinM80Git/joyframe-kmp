@@ -25,8 +25,9 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 @Composable
-actual fun GameView(frame: GpuSceneFrame, modifier: Modifier, active: Boolean, options: GameViewOptions) {
-    SplitGameView(listOf(frame), modifier, active, options = options)
+actual fun GameView(frame: GpuSceneFrame, modifier: Modifier, active: Boolean, options: GameViewOptions,
+                    onFirstFrame: () -> Unit) {
+    SplitGameView(listOf(frame), modifier, active, options = options, onFirstFrame = onFirstFrame)
 }
 
 /**
@@ -36,12 +37,19 @@ actual fun GameView(frame: GpuSceneFrame, modifier: Modifier, active: Boolean, o
  */
 @Composable
 actual fun SplitGameView(frames: List<GpuSceneFrame>, modifier: Modifier, active: Boolean, gutter: PackedColor,
-                         gapDp: Float, options: GameViewOptions) {
+                         gapDp: Float, options: GameViewOptions, onFirstFrame: () -> Unit) {
     require(frames.size in 1..SplitLayout.MAX_PANES) { "SplitGameView needs 1 to ${SplitLayout.MAX_PANES} frames" }
     val context = LocalContext.current
     val density = LocalDensity.current.density
     val renderer = remember { SceneRenderer(frames) }
     val view = remember { SceneSurface(context, renderer) }
+    val firstFrame by rememberUpdatedState(onFirstFrame)
+    DisposableEffect(renderer) {
+        // The GL thread says when it has drawn; the UI thread hears it, unless the view has gone by then.
+        var live = true
+        renderer.onFirstFrame = { view.post { if (live) firstFrame() } }
+        onDispose { live = false; renderer.onFirstFrame = null }
+    }
     SideEffect {
         view.options = options
         // The buffer is scaled, so the gutter is too.
@@ -131,6 +139,9 @@ private class SceneRenderer(initial: List<GpuSceneFrame>) : GLSurfaceView.Render
     private var backend: GlSceneBackend? = null
     private var width = 1
     private var height = 1
+    /** Called on the GL thread after the first frame is drawn, once. */
+    @Volatile var onFirstFrame: (() -> Unit)? = null
+    private var drawn = false
 
     fun publish(next: List<GpuSceneFrame>, gutter: PackedColor, gapPixels: Int) = lock.withLock {
         frames = next; this.gutter = gutter; this.gapPixels = gapPixels
@@ -156,7 +167,9 @@ private class SceneRenderer(initial: List<GpuSceneFrame>) : GLSurfaceView.Render
             taken = published
             Triple(frames, gutter, gapPixels)
         }
-        backend?.renderPanes(current, width.coerceAtLeast(1), height.coerceAtLeast(1), colour, gap)
+        val backend = backend ?: return
+        backend.renderPanes(current, width.coerceAtLeast(1), height.coerceAtLeast(1), colour, gap)
+        if (!drawn) onFirstFrame?.let { drawn = true; it() }
     }
 
     private companion object { const val MAX_WAIT_NANOS = 50_000_000L }
