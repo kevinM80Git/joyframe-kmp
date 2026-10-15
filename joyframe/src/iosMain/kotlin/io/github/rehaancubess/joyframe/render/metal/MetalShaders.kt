@@ -23,6 +23,7 @@ struct Vertex {
     packed_float3 position;
     packed_float3 normal;
     packed_float2 uv;
+    packed_float4 color;
 };
 
 struct FrameUniforms {
@@ -52,6 +53,7 @@ struct FrameUniforms {
     float4 vortexHull;       // xy = hull position, z = its suction 0..1, w = 1 / reach
     float4 vortexDeath;      // xy = swallow position, z = envelope 0..1, w = climax strength
     float4 waterTime;        // x = seconds
+    float4 grade;            // x = saturation, y = contrast, z = emissive fog resistance
 };
 
 struct DrawUniforms {
@@ -61,6 +63,7 @@ struct DrawUniforms {
     float4 emissive;         // rgb premultiplied by strength, w = soap-bubble rim flag
     float4 materialParams;   // x = roughness, y = metallic, z = receives shadow, w = has albedo
     float4 waterParams;      // x = water shade, y = vortex, z = is foam, w = foam age 0..1
+    float4 emissiveMode;     // x = glow from vertex colour, y = glow from albedo texture
 };
 
 struct SkyUniforms {
@@ -70,6 +73,12 @@ struct SkyUniforms {
     float4 zenithColor;
     float4 horizonColor;
     float4 cloudColor;
+    float4 moon;             // xyz = direction to the moon, w = angular radius
+    float4 moonColor;        // rgb, a = glow (0 hides it)
+    float4 stars;            // x = brightness (0 skips)
+    float4 skyline;          // a = opacity (0 skips)
+    float4 skylineColor;
+    float4 skylineLights;
 };
 
 struct SceneVertexOut {
@@ -78,6 +87,7 @@ struct SceneVertexOut {
     float3 worldNormal;
     float4 lightClip;
     float2 uv;
+    float4 color;
 
     float waterCrest;
 
@@ -131,6 +141,7 @@ vertex SceneVertexOut scene_vertex(
     out.worldNormal = normal;
     out.lightClip = frame.lightViewProjection * world;
     out.uv = v.uv;
+    out.color = float4(v.color);
     out.waterCrest = crest;
     out.waterFade = fade;
     return out;
@@ -249,8 +260,8 @@ fragment float4 scene_fragment(
     depth2d<float> shadowMap [[texture(0)]],
     texture2d<float> albedoMap [[texture(1)]]
 ) {
-    float4 base = draw.baseColor;
-    if (draw.materialParams.w > 0.5) base *= albedoMap.sample(albedoSampler, in.uv);
+    float4 albedoSample = draw.materialParams.w > 0.5 ? albedoMap.sample(albedoSampler, in.uv) : float4(1.0);
+    float4 base = draw.baseColor * in.color * albedoSample;
     if (draw.waterParams.z > 0.0) {
         float2 local = in.uv * 2.0 - 1.0;
         float age = draw.waterParams.w;
@@ -345,13 +356,15 @@ fragment float4 scene_fragment(
     color += albedo * frame.fillColor.rgb * fill;
     color += specularTint * frame.lightColor.rgb * specular * shadow * mix(0.35, 0.9, metallic);
     color = 1.0 - exp(-color * frame.shadowParams.w);
-    const float saturation = 1.24;
-    const float contrast = 0.20;
+    float saturation = frame.grade.x;
+    float contrast = frame.grade.y;
     float luma = dot(color, float3(0.2126, 0.7152, 0.0722));
     color = clamp(luma + (color - luma) * saturation, 0.0, 1.0);
     color = mix(color, smoothstep(0.0, 1.0, color), contrast);
 
-    color += draw.emissive.rgb;
+    float3 glow = draw.emissive.rgb * mix(float3(1.0), in.color.rgb, draw.emissiveMode.x) * mix(float3(1.0), albedoSample.rgb, draw.emissiveMode.y) *
+        mix(1.0, in.color.a, draw.emissiveMode.z);
+    color += glow;
     if (waterShade > 0.0) {
         float grazing = 1.0 - saturate(dot(normal, toView));
         float grazing2 = grazing * grazing;
@@ -422,7 +435,8 @@ fragment float4 scene_fragment(
     float fogRange = max(frame.fogParams.y - frame.fogParams.x, 1.0);
     float fog = saturate((viewDistance - frame.fogParams.x) / fogRange) * frame.fogParams.z;
     color = mix(color, frame.fogColor.rgb, fog);
-    float alpha = base.a * in.waterFade;
+    color += glow * fog * frame.grade.z;
+    float alpha = mix(base.a, draw.baseColor.a * albedoSample.a, draw.emissiveMode.z) * in.waterFade;
     if (draw.emissive.w > 0.5) {
         float grazing = 1.0 - saturate(abs(dot(normal, toView)));
         float rim = grazing * grazing;
@@ -486,14 +500,65 @@ fragment float4 sky_fragment(SkyVertexOut in [[stage_in]], constant SkyUniforms&
     float3 sunDir = normalize(float3(0.38, 1.0, 0.22));
     float sun = pow(saturate(dot(direction, sunDir)), 72.0);
     float halo = pow(saturate(dot(direction, sunDir)), 8.0);
-    color += float3(1.0, 0.93, 0.72) * sun * 0.95 + float3(1.0, 0.82, 0.45) * halo * 0.18;
+    color += (float3(1.0, 0.93, 0.72) * sun * 0.95 + float3(1.0, 0.82, 0.45) * halo * 0.18) * sky.zenithColor.w;
 
-    if (direction.y > 0.015) {
+    if (sky.cloudColor.w > 0.0 && direction.y > 0.015) {
         float2 deck = direction.xz / direction.y * 0.6 + sky.up.w * float2(0.010, 0.004);
         float noise = skyNoise(deck) * 0.54 + skyNoise(deck * 2.13) * 0.29 + skyNoise(deck * 4.37) * 0.17;
         float cover = smoothstep(0.50, 0.76, noise) * smoothstep(0.015, 0.26, direction.y);
         float shading = 0.86 + 0.14 * smoothstep(0.48, 0.82, noise);
-        color = mix(color, sky.cloudColor.rgb * shading, cover * 0.94);
+        color = mix(color, sky.cloudColor.rgb * shading, cover * 0.94 * sky.cloudColor.w);
+    }
+
+    if (sky.stars.x > 0.0 && direction.y > 0.02) {
+        float2 grid = float2(atan2(direction.z, direction.x) * 96.0, direction.y * 160.0);
+        float2 cell = floor(grid);
+        float pick = skyHash(cell);
+        if (pick > 0.86) {
+            float2 spot = float2(skyHash(cell + 7.1), skyHash(cell + 3.7)) * 0.7 + 0.15;
+            float d = length(fract(grid) - spot);
+            float twinkle = 0.65 + 0.35 * sin(sky.up.w * (1.3 + pick * 3.0) + pick * 40.0);
+            float size = mix(0.07, 0.16, skyHash(cell + 1.3));
+            float star = smoothstep(size, 0.0, d) * twinkle * smoothstep(0.02, 0.22, direction.y);
+            color += float3(0.82, 0.86, 1.0) * star * sky.stars.x * (pick - 0.86) * 7.0;
+        }
+    }
+
+    // Skyline: two layers of blocky towers around the horizon (azimuth cells), the far one hazier.
+    if (sky.skyline.a > 0.0 && direction.y > -0.05 && direction.y < 0.2) {
+        float azimuth = atan2(direction.z, direction.x);
+        for (int layer = 0; layer < 2; ++layer) {
+            float k = layer == 0 ? 58.0 : 31.0;
+            float cellF = floor(azimuth * k + float(layer) * 17.0);
+            float h = skyHash(float2(cellF, float(layer) * 9.0));
+            float tall = h * h * (layer == 0 ? 0.075 : 0.11) + (layer == 0 ? 0.012 : 0.006);
+            if (skyHash(float2(cellF, 3.3)) > 0.93) tall += 0.03;  // a landmark
+            float inside = step(direction.y, tall);
+            float3 tone = layer == 0 ? mix(sky.skylineColor.rgb, color, 0.55) : sky.skylineColor.rgb;
+            if (inside > 0.0) {
+                color = mix(color, tone, sky.skyline.a);
+                // Windows: sparse lit dots on the near layer.
+                if (layer == 1) {
+                    float2 win = float2(azimuth * k * 9.0, direction.y * 520.0);
+                    float2 wc = floor(win);
+                    float lit = step(0.9, skyHash(wc + cellF));
+                    float2 wf = fract(win);
+                    float shape = step(0.25, wf.x) * step(wf.x, 0.75) * step(0.3, wf.y) * step(wf.y, 0.7);
+                    color += sky.skylineLights.rgb * lit * shape * sky.skylineLights.a * sky.skyline.a * step(direction.y, tall - 0.004);
+                }
+            }
+        }
+    }
+
+    if (sky.moonColor.a > 0.0) {
+        float3 moonDir = normalize(sky.moon.xyz);
+        float angle = acos(clamp(dot(direction, moonDir), -1.0, 1.0));
+        float disc = smoothstep(sky.moon.w, sky.moon.w * 0.94, angle);
+        float3 side = normalize(cross(moonDir, float3(0.0, 1.0, 0.0)) + float3(1e-4));
+        float limb = 0.78 + 0.22 * saturate(dot(direction - moonDir, side) / max(sky.moon.w, 1e-3) * -0.8 + 0.5);
+        float halo = exp(-max(angle - sky.moon.w, 0.0) / max(sky.moon.w * 1.6, 1e-3));
+        color = mix(color, sky.moonColor.rgb * limb, disc);
+        color += sky.moonColor.rgb * halo * 0.35 * sky.moonColor.a * (1.0 - disc);
     }
 
     return float4(color, 1.0);

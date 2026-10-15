@@ -26,9 +26,10 @@ actual object DeviceTilt {
     actual val steer: Float get() = if (handle != null) tracker.steer else 0f
 }
 
-// Touch devices only: desktop browsers define DeviceMotionEvent but never fire it.
+// Touch devices only: desktop browsers define DeviceMotionEvent but never fire it. Secure pages only
+// (https or localhost): browsers send no motion events to plain http pages.
 private fun motionSupported(): Boolean =
-    js("typeof DeviceMotionEvent !== 'undefined' && (navigator.maxTouchPoints > 0)")
+    js("typeof DeviceMotionEvent !== 'undefined' && (navigator.maxTouchPoints > 0) && window.isSecureContext === true")
 
 private fun listenMotion(reading: (Double, Double) -> Unit): JsAny = js("""(function() {
     var on = function(e) {

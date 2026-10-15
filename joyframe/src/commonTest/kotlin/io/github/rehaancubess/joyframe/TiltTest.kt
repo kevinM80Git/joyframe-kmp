@@ -39,6 +39,20 @@ class TiltTest {
         tracker.recenter(); assertEquals(0f, tracker.steer)
     }
 
+    @Test fun aShakeIsSmoothedButAHeldTiltArrives() {
+        val tracker = TiltTracker()
+        val (x0, y0) = gravityAt(0.0); tracker.reading(x0, y0)
+        // One jolt to full lock moves the wheel only part of the way...
+        val (jx, jy) = gravityAt(-40.0); tracker.reading(jx, jy)
+        assertTrue(tracker.steer > 0f && tracker.steer < .5f, "one jolt: ${tracker.steer}")
+        tracker.reading(x0, y0)
+        // ...a tilt held for a sixth of a second (10 readings) is there.
+        repeat(10) { tracker.reading(jx, jy) }
+        assertTrue(tracker.steer > .95f, "held: ${tracker.steer}")
+        repeat(20) { tracker.reading(x0, y0) }
+        assertEquals(0f, tracker.steer, "back to exactly centre")
+    }
+
     @Test fun tiltAddsToDriveSteering() {
         val input = ActionInput()
         input.tiltSteer = .5f

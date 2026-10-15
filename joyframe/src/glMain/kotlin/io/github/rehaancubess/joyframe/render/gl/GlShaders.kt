@@ -19,6 +19,17 @@ internal object GlShaders {
 
     fun sceneVertex(dialect: GlslDialect) = dialect.header + WATER_DEFINES + SCENE_VERTEX
     fun sceneFragment(dialect: GlslDialect) = dialect.fragmentHeader + WATER_DEFINES + SCENE_FRAGMENT
+    /**
+     * The lean scene program (no water, vortex or foam paths): used automatically for every material
+     * that needs none of them. Its fragment stage runs at mediump on GLES (twice the rate on most mobile
+     * GPUs); positions stay highp in the vertex stage, which hands over a scaled camera vector.
+     */
+    fun sceneLiteVertex(dialect: GlslDialect, shadows: Boolean) =
+        dialect.header + (if (shadows) "#define LITE_SHADOW 1\n" else "") + SCENE_LITE_VERTEX
+    fun sceneLiteFragment(dialect: GlslDialect, shadows: Boolean) =
+        (if (dialect == GlslDialect.Es300) "#version 300 es\nprecision mediump float;\nprecision highp sampler2DShadow;\n"
+        else dialect.fragmentHeader) + (if (shadows) "#define LITE_SHADOW 1\n" else "") + SCENE_LITE_FRAGMENT
+
     fun shadowVertex(dialect: GlslDialect) = dialect.header + SHADOW_VERTEX
     fun shadowFragment(dialect: GlslDialect) = dialect.fragmentHeader + SHADOW_FRAGMENT
     fun skyVertex(dialect: GlslDialect) = dialect.header + SKY_VERTEX
@@ -30,6 +41,12 @@ internal object GlShaders {
     const val ATTRIB_POSITION = 0
     const val ATTRIB_NORMAL = 1
     const val ATTRIB_TEXCOORD = 2
+    const val ATTRIB_VERTEX_COLOR = 3
+
+    /** Per-instance (divisor 1): model matrix columns, normal matrix columns, tint. */
+    const val ATTRIB_INSTANCE_MODEL = 4
+    const val ATTRIB_INSTANCE_NORMAL = 8
+    const val ATTRIB_INSTANCE_TINT = 11
 
 
     const val ATTRIB_COLOR = 1
@@ -48,11 +65,19 @@ internal object GlShaders {
 in vec3 aPosition;
 in vec3 aNormal;
 in vec2 aTexCoord;
+in vec4 aVertexColor;
+// Per instance: every draw is instanced (a lone draw is a batch of one).
+in vec4 aModel0;
+in vec4 aModel1;
+in vec4 aModel2;
+in vec4 aModel3;
+in vec4 aNormalMatrix0;
+in vec4 aNormalMatrix1;
+in vec4 aNormalMatrix2;
+in vec4 aTint;
 
 uniform mat4 uViewProjection;
 uniform mat4 uLightViewProjection;
-uniform mat4 uModel;
-uniform mat4 uNormalMatrix;
 
 uniform float uTime;
 
@@ -70,6 +95,8 @@ out vec3 vWorldPosition;
 out vec3 vWorldNormal;
 out vec4 vLightClip;
 out vec2 vTexCoord;
+out vec4 vColor;
+out vec4 vTint;
 
 out float vWaterCrest;
 
@@ -90,9 +117,13 @@ vec3 waterWaves(vec2 position, float time) {
 }
 
 void main() {
-    vec4 world = uModel * vec4(aPosition, 1.0);
-    vec3 normal = (uNormalMatrix * vec4(aNormal, 0.0)).xyz;
+    mat4 model = mat4(aModel0, aModel1, aModel2, aModel3);
+    mat3 normalMatrix = mat3(aNormalMatrix0.xyz, aNormalMatrix1.xyz, aNormalMatrix2.xyz);
+    vec4 world = model * vec4(aPosition, 1.0);
+    vec3 normal = normalMatrix * aNormal;
     vTexCoord = aTexCoord;
+    vColor = aVertexColor;
+    vTint = aTint;
     vWaterCrest = 0.0;
     vWaterFade = 1.0;
 
@@ -123,9 +154,12 @@ in vec3 vWorldPosition;
 in vec3 vWorldNormal;
 in vec4 vLightClip;
 in vec2 vTexCoord;
+in vec4 vColor;
+in vec4 vTint;
 in float vWaterCrest;
 in float vWaterFade;
 
+uniform vec4 uGrade;          // x = saturation, y = contrast, z = emissive fog resistance
 uniform vec4 uCameraPosition;
 uniform vec4 uLightDirection;
 uniform vec4 uLightColor;
@@ -138,6 +172,7 @@ uniform vec4 uShadowParams;   // x = texel size, y = depth bias, z = strength, w
 uniform vec4 uBaseColor;
 uniform vec4 uEmissive;       // rgb = glow, a = soap-bubble rim flag
 uniform vec4 uMaterialParams; // x = roughness, y = metallic, z = receives shadow, w = has albedo
+uniform vec4 uEmissiveMode;   // x = glow from vertex colour, y = glow from albedo texture, z = glow masked by vertex alpha
 
 uniform float uTime;
 uniform float uWaterShade;    // per draw: 0 = not water, else how much surface treatment
@@ -258,8 +293,8 @@ float sampleShadow(vec4 lightClip, float texel, float bias) {
 }
 
 void main() {
-    vec4 base = uBaseColor;
-    if (uMaterialParams.w > 0.5) base *= texture(uAlbedo, vTexCoord);
+    vec4 albedoSample = uMaterialParams.w > 0.5 ? texture(uAlbedo, vTexCoord) : vec4(1.0);
+    vec4 base = uBaseColor * vTint * vColor * albedoSample;
     if (uFoam.x > 0.0) {
         vec2 local = vTexCoord * 2.0 - 1.0;
         float age = uFoam.y;
@@ -352,13 +387,13 @@ void main() {
     color += albedo * uFillColor.rgb * fill;
     color += specularTint * uLightColor.rgb * specular * shadow * mix(0.35, 0.9, metallic);
     color = 1.0 - exp(-color * uShadowParams.w);
-    const float saturation = 1.24;
-    const float contrast = 0.20;
     float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
-    color = saturate3(luma + (color - luma) * saturation);
-    color = mix(color, smoothstep(0.0, 1.0, color), contrast);
+    color = saturate3(luma + (color - luma) * uGrade.x);
+    color = mix(color, smoothstep(0.0, 1.0, color), uGrade.y);
 
-    color += uEmissive.rgb;
+    vec3 glow = uEmissive.rgb * vTint.rgb * mix(vec3(1.0), vColor.rgb, uEmissiveMode.x) * mix(vec3(1.0), albedoSample.rgb, uEmissiveMode.y) *
+        mix(1.0, vColor.a, uEmissiveMode.z);
+    color += glow;
     if (uWaterShade > 0.0) {
         float grazing = 1.0 - saturate(dot(normal, toView));
         float grazing2 = grazing * grazing;
@@ -427,12 +462,157 @@ void main() {
     float fogRange = max(uFogParams.y - uFogParams.x, 1.0);
     float fog = saturate((viewDistance - uFogParams.x) / fogRange) * uFogParams.z;
     color = mix(color, uFogColor.rgb, fog);
-    float alpha = base.a * vWaterFade;
+    // Neon punches through fog: give back the share of the glow the fog took.
+    color += glow * fog * uGrade.z;
+    float alpha = mix(base.a, uBaseColor.a * vTint.a * albedoSample.a, uEmissiveMode.z) * vWaterFade;
     if (uEmissive.a > 0.5) {
         float grazing = 1.0 - saturate(abs(dot(normal, toView)));
         float rim = grazing * grazing;
         color = mix(color, vec3(0.90, 0.99, 1.0), saturate(rim * 1.25));
         alpha = mix(0.05, 0.78, rim) * vWaterFade * base.a;
+    }
+    fragColor = vec4(color, alpha);
+}
+"""
+
+    private const val SCENE_LITE_VERTEX = """
+in vec3 aPosition;
+in vec3 aNormal;
+in vec2 aTexCoord;
+in vec4 aVertexColor;
+in vec4 aModel0;
+in vec4 aModel1;
+in vec4 aModel2;
+in vec4 aModel3;
+in vec4 aNormalMatrix0;
+in vec4 aNormalMatrix1;
+in vec4 aNormalMatrix2;
+in vec4 aTint;
+
+uniform mat4 uViewProjection;
+uniform vec4 uCameraPosition;
+#ifdef LITE_SHADOW
+uniform mat4 uLightViewProjection;
+out vec4 vLightClip;
+#endif
+
+// The camera vector scaled by 1/1024 so its squared length fits in half precision downstream.
+out vec3 vToEye;
+out vec3 vWorldNormal;
+out vec2 vTexCoord;
+out vec4 vColor;
+out vec4 vTint;
+
+void main() {
+    mat4 model = mat4(aModel0, aModel1, aModel2, aModel3);
+    vec4 world = model * vec4(aPosition, 1.0);
+    vWorldNormal = mat3(aNormalMatrix0.xyz, aNormalMatrix1.xyz, aNormalMatrix2.xyz) * aNormal;
+    vToEye = (uCameraPosition.xyz - world.xyz) * (1.0 / 1024.0);
+    vTexCoord = aTexCoord;
+    vColor = aVertexColor;
+    vTint = aTint;
+#ifdef LITE_SHADOW
+    vLightClip = uLightViewProjection * world;
+#endif
+    gl_Position = uViewProjection * world;
+}
+"""
+
+    private const val SCENE_LITE_FRAGMENT = """
+in vec3 vToEye;
+in vec3 vWorldNormal;
+in vec2 vTexCoord;
+in vec4 vColor;
+in vec4 vTint;
+#ifdef LITE_SHADOW
+in highp vec4 vLightClip;
+uniform sampler2DShadow uShadowMap;
+#endif
+
+uniform vec4 uGrade;          // x = saturation, y = contrast, z = emissive fog resistance
+uniform vec4 uLightDirection;
+uniform vec4 uLightColor;
+uniform vec4 uFillDirection;
+uniform vec4 uFillColor;
+uniform vec4 uAmbientColor;
+uniform vec4 uFogColor;
+uniform vec4 uFogParams;      // x = start, y = end, z = maximum density (all / 1024 in the lite program)
+uniform vec4 uShadowParams;   // x = texel size, y = depth bias, z = strength, w = exposure
+uniform vec4 uBaseColor;
+uniform vec4 uEmissive;       // rgb = glow, a = soap-bubble rim flag
+uniform vec4 uMaterialParams; // x = roughness, y = metallic, z = receives shadow, w = has albedo
+uniform vec4 uEmissiveMode;   // x = glow from vertex colour, y = glow from albedo, z = glow masked by vertex alpha
+uniform sampler2D uAlbedo;
+
+out vec4 fragColor;
+
+float saturate(float value) { return clamp(value, 0.0, 1.0); }
+vec3 saturate3(vec3 value) { return clamp(value, 0.0, 1.0); }
+
+#ifdef LITE_SHADOW
+float sampleShadow(highp vec4 lightClip, float texel, float bias) {
+    highp vec3 projected = lightClip.xyz / max(lightClip.w, 1e-4);
+    highp vec3 uvz = projected * 0.5 + 0.5;
+    if (uvz.x < 0.0 || uvz.x > 1.0 || uvz.y < 0.0 || uvz.y > 1.0 || uvz.z > 1.0) return 1.0;
+    highp float reference = uvz.z - bias;
+    highp vec2 tap = vec2(texel * 0.75);
+    float sum = texture(uShadowMap, vec3(uvz.xy + vec2(-tap.x, -tap.y), reference));
+    sum += texture(uShadowMap, vec3(uvz.xy + vec2(tap.x, -tap.y), reference));
+    sum += texture(uShadowMap, vec3(uvz.xy + vec2(-tap.x, tap.y), reference));
+    sum += texture(uShadowMap, vec3(uvz.xy + vec2(tap.x, tap.y), reference));
+    return sum * 0.25;
+}
+#endif
+
+void main() {
+    vec4 albedoSample = uMaterialParams.w > 0.5 ? texture(uAlbedo, vTexCoord) : vec4(1.0);
+    vec4 base = uBaseColor * vTint * vColor * albedoSample;
+    vec3 albedo = base.rgb;
+    vec3 normal = normalize(vWorldNormal);
+    vec3 toLight = -uLightDirection.xyz;
+    vec3 toFill = -uFillDirection.xyz;
+    float eyeLength = max(length(vToEye), 1e-4);
+    vec3 toView = vToEye / eyeLength;
+    const float wrap = 0.26;
+    float key = saturate((dot(normal, toLight) + wrap) / (1.0 + wrap));
+    float fill = saturate((dot(normal, toFill) + wrap) / (1.0 + wrap));
+
+    float shadow = 1.0;
+#ifdef LITE_SHADOW
+    if (uMaterialParams.z > 0.5 && uShadowParams.z > 0.001) {
+        shadow = mix(1.0, sampleShadow(vLightClip, uShadowParams.x, uShadowParams.y), uShadowParams.z);
+    }
+#endif
+
+    float roughness = clamp(uMaterialParams.x, 0.05, 1.0);
+    float metallic = saturate(uMaterialParams.y);
+    vec3 color = albedo * (uAmbientColor.rgb + uLightColor.rgb * (key * shadow) + uFillColor.rgb * fill);
+    // Specular only where the material has any (rough surfaces skip the power entirely).
+    if (roughness < 0.98) {
+        vec3 halfway = normalize(toLight + toView);
+        float highlight = pow(saturate(dot(normal, halfway)), mix(110.0, 6.0, roughness));
+        vec3 specularTint = mix(vec3(1.0), albedo, metallic);
+        color += specularTint * uLightColor.rgb * (highlight * (1.0 - roughness) * shadow * mix(0.35, 0.9, metallic));
+    }
+    color = 1.0 - exp(-color * uShadowParams.w);
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    color = saturate3(luma + (color - luma) * uGrade.x);
+    color = mix(color, smoothstep(0.0, 1.0, color), uGrade.y);
+
+    vec3 glow = uEmissive.rgb * vTint.rgb * mix(vec3(1.0), vColor.rgb, uEmissiveMode.x) * mix(vec3(1.0), albedoSample.rgb, uEmissiveMode.y) *
+        mix(1.0, vColor.a, uEmissiveMode.z);
+    color += glow;
+
+    float fogRange = max(uFogParams.y - uFogParams.x, 1e-3);
+    float fog = saturate((eyeLength - uFogParams.x) / fogRange) * uFogParams.z;
+    color = mix(color, uFogColor.rgb, fog);
+    color += glow * fog * uGrade.z;
+    float alpha = mix(base.a, uBaseColor.a * vTint.a * albedoSample.a, uEmissiveMode.z);
+    if (uEmissive.a > 0.5) {
+        float grazing = 1.0 - saturate(abs(dot(normal, toView)));
+        float rim = grazing * grazing;
+        color = mix(color, vec3(0.90, 0.99, 1.0), saturate(rim * 1.25));
+        alpha = mix(0.05, 0.78, rim) * base.a;
     }
     fragColor = vec4(color, alpha);
 }
@@ -473,6 +653,12 @@ uniform vec4 uSkyUp;        // xyz = camera up,      w = time in seconds
 uniform vec4 uZenithColor;
 uniform vec4 uHorizonColor;
 uniform vec4 uCloudColor;
+uniform vec4 uMoon;         // xyz = direction to the moon, w = angular radius (radians)
+uniform vec4 uMoonColor;    // rgb = colour, a = glow (0 hides it)
+uniform vec4 uStars;        // x = star brightness (0 skips the field)
+uniform vec4 uSkyline;      // rgb unused, a = skyline opacity (0 skips it)
+uniform vec4 uSkylineColor; // rgb = near silhouette colour
+uniform vec4 uSkylineLights;// rgb = window colour, a = window brightness
 
 out vec4 fragColor;
 
@@ -505,17 +691,74 @@ void main() {
 
     float height = saturate(direction.y * 1.25);
     vec3 color = mix(uHorizonColor.rgb, uZenithColor.rgb, pow(height, 0.62));
-    vec3 sunDir = normalize(vec3(0.38, 1.0, 0.22));
-    float sun = pow(saturate(dot(direction, sunDir)), 72.0);
-    float halo = pow(saturate(dot(direction, sunDir)), 8.0);
-    color += vec3(1.0, 0.93, 0.72) * sun * 0.95 + vec3(1.0, 0.82, 0.45) * halo * 0.18;
+    // uZenithColor.w is the sun's strength; at 0 (a night sky) its two powers are skipped (uniform branch).
+    if (uZenithColor.w > 0.0) {
+        vec3 sunDir = normalize(vec3(0.38, 1.0, 0.22));
+        float sun = pow(saturate(dot(direction, sunDir)), 72.0);
+        float halo = pow(saturate(dot(direction, sunDir)), 8.0);
+        color += (vec3(1.0, 0.93, 0.72) * sun * 0.95 + vec3(1.0, 0.82, 0.45) * halo * 0.18) * uZenithColor.w;
+    }
 
-    if (direction.y > 0.015) {
+    // uCloudColor.w is cloud cover; at 0 the whole noise branch is skipped (uniform branch).
+    if (uCloudColor.w > 0.0 && direction.y > 0.015) {
         vec2 deck = direction.xz / direction.y * 0.6 + uSkyUp.w * vec2(0.010, 0.004);
         float noise = skyNoise(deck) * 0.54 + skyNoise(deck * 2.13) * 0.29 + skyNoise(deck * 4.37) * 0.17;
         float cover = smoothstep(0.50, 0.76, noise) * smoothstep(0.015, 0.26, direction.y);
         float shading = 0.86 + 0.14 * smoothstep(0.48, 0.82, noise);
-        color = mix(color, uCloudColor.rgb * shading, cover * 0.94);
+        color = mix(color, uCloudColor.rgb * shading, cover * 0.94 * uCloudColor.w);
+    }
+
+    // Stars: one hashed point per cell of a lat-long grid, faded toward the horizon, slow twinkle.
+    if (uStars.x > 0.0 && direction.y > 0.02) {
+        vec2 grid = vec2(atan(direction.z, direction.x) * 96.0, direction.y * 160.0);
+        vec2 cell = floor(grid);
+        float pick = skyHash(cell);
+        if (pick > 0.86) {
+            vec2 spot = vec2(skyHash(cell + 7.1), skyHash(cell + 3.7)) * 0.7 + 0.15;
+            float d = length(fract(grid) - spot);
+            float twinkle = 0.65 + 0.35 * sin(uSkyUp.w * (1.3 + pick * 3.0) + pick * 40.0);
+            float size = mix(0.07, 0.16, skyHash(cell + 1.3));
+            float star = smoothstep(size, 0.0, d) * twinkle * smoothstep(0.02, 0.22, direction.y);
+            color += vec3(0.82, 0.86, 1.0) * star * uStars.x * (pick - 0.86) * 7.0;
+        }
+    }
+
+    // Skyline: two layers of blocky towers around the horizon (azimuth cells), the far one hazier.
+    if (uSkyline.a > 0.0 && direction.y > -0.05 && direction.y < 0.2) {
+        float azimuth = atan(direction.z, direction.x);
+        for (int layer = 0; layer < 2; ++layer) {
+            float k = layer == 0 ? 58.0 : 31.0;
+            float cellF = floor(azimuth * k + float(layer) * 17.0);
+            float h = skyHash(vec2(cellF, float(layer) * 9.0));
+            float tall = h * h * (layer == 0 ? 0.075 : 0.11) + (layer == 0 ? 0.012 : 0.006);
+            if (skyHash(vec2(cellF, 3.3)) > 0.93) tall += 0.03;  // a landmark
+            float inside = step(direction.y, tall);
+            vec3 tone = layer == 0 ? mix(uSkylineColor.rgb, color, 0.55) : uSkylineColor.rgb;
+            if (inside > 0.0) {
+                color = mix(color, tone, uSkyline.a);
+                // Windows: sparse lit dots on the near layer.
+                if (layer == 1) {
+                    vec2 win = vec2(azimuth * k * 9.0, direction.y * 520.0);
+                    vec2 wc = floor(win);
+                    float lit = step(0.9, skyHash(wc + cellF));
+                    vec2 wf = fract(win);
+                    float shape = step(0.25, wf.x) * step(wf.x, 0.75) * step(0.3, wf.y) * step(wf.y, 0.7);
+                    color += uSkylineLights.rgb * lit * shape * uSkylineLights.a * uSkyline.a * step(direction.y, tall - 0.004);
+                }
+            }
+        }
+    }
+
+    // Moon: a crisp disc with a soft halo, a little darker toward one limb.
+    if (uMoonColor.a > 0.0) {
+        vec3 moonDir = normalize(uMoon.xyz);
+        float angle = acos(clamp(dot(direction, moonDir), -1.0, 1.0));
+        float disc = smoothstep(uMoon.w, uMoon.w * 0.94, angle);
+        vec3 side = normalize(cross(moonDir, vec3(0.0, 1.0, 0.0)) + vec3(1e-4));
+        float limb = 0.78 + 0.22 * saturate(dot(direction - moonDir, side) / max(uMoon.w, 1e-3) * -0.8 + 0.5);
+        float halo = exp(-max(angle - uMoon.w, 0.0) / max(uMoon.w * 1.6, 1e-3));
+        color = mix(color, uMoonColor.rgb * limb, disc);
+        color += uMoonColor.rgb * halo * 0.35 * uMoonColor.a * (1.0 - disc);
     }
 
     fragColor = vec4(color, 1.0);

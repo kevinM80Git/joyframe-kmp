@@ -59,8 +59,11 @@ actual object PlatformGamepad {
         var horizontal = d.stickX
         if (left) horizontal = -1f
         if (right) horizontal = 1f
-        val throttle = if (d.throttleAxis < TRIGGER_DEADZONE) 0f else d.throttleAxis
-        val brake = if (d.brakeAxis < TRIGGER_DEADZONE) 0f else d.brakeAxis
+        // Some pads (and some Fire TV controller firmware) report triggers as L2/R2 buttons only.
+        val throttle = maxOf(if (d.throttleAxis < TRIGGER_DEADZONE) 0f else d.throttleAxis,
+            if (down(KeyEvent.KEYCODE_BUTTON_R2)) 1f else 0f)
+        val brake = maxOf(if (d.brakeAxis < TRIGGER_DEADZONE) 0f else d.brakeAxis,
+            if (down(KeyEvent.KEYCODE_BUTTON_L2)) 1f else 0f)
         var vertical = throttle - brake
         if (up) vertical = 1f
         if (downPad) vertical = -1f
@@ -112,6 +115,12 @@ actual object PlatformGamepad {
         rumbleHardware(durationMs, intensity)
     }
 
+    actual fun rumble(controllerId: String, durationMs: Int, intensity: Float) {
+        if (!GamepadTuning.current.gamepadRumbleEnabled) return
+        val id = controllerId.removePrefix("android-").toIntOrNull() ?: return
+        vibrate(vibratorOf(id) ?: return, durationMs, intensity)
+    }
+
     /** Forward from Activity.dispatchKeyEvent. Returns true when a controller button was consumed. */
     fun handleKeyEvent(event: KeyEvent): Boolean {
         if (!event.isFromGamepad()) return false
@@ -154,7 +163,10 @@ actual object PlatformGamepad {
         source and (InputDevice.SOURCE_GAMEPAD or InputDevice.SOURCE_JOYSTICK) != 0
 
     private fun rumbleHardware(durationMs: Int, intensity: Float) {
-        val vibrator = connectedVibrator() ?: return
+        vibrate(connectedVibrator() ?: return, durationMs, intensity)
+    }
+
+    private fun vibrate(vibrator: Vibrator, durationMs: Int, intensity: Float) {
         val duration = durationMs.toLong().coerceIn(1L, 1_000L)
         val amplitude = (intensity.coerceIn(0f, 1f) * 255f).toInt().coerceIn(1, 255)
         try {
@@ -165,7 +177,10 @@ actual object PlatformGamepad {
 
     private fun connectedVibrator(): Vibrator? {
         refreshDevicesIfStale()
-        val id = connected.firstOrNull()?.first ?: return null
+        return vibratorOf(connected.firstOrNull()?.first ?: return null)
+    }
+
+    private fun vibratorOf(id: Int): Vibrator? {
         val device = InputDevice.getDevice(id) ?: return null
         val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             device.vibratorManager.defaultVibrator
@@ -199,7 +214,8 @@ actual object PlatformGamepad {
 
     private val HANDLED_KEYS = setOf(
         KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_BUTTON_X, KeyEvent.KEYCODE_BUTTON_Y,
-        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_START,
+        KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_L2, KeyEvent.KEYCODE_BUTTON_R2,
+        KeyEvent.KEYCODE_BUTTON_START,
         KeyEvent.KEYCODE_BUTTON_SELECT, KeyEvent.KEYCODE_BUTTON_THUMBL, KeyEvent.KEYCODE_BUTTON_THUMBR,
         KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
     )

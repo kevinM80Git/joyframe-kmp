@@ -24,6 +24,12 @@ actual object PlatformGamepad {
         if (!GamepadTuning.current.gamepadRumbleEnabled) return
         backend.rumble(durationMs, intensity)
     }
+
+    /** Desktop backends have no rumble yet: a no-op, like [rumble]. */
+    actual fun rumble(controllerId: String, durationMs: Int, intensity: Float) {
+        if (!GamepadTuning.current.gamepadRumbleEnabled) return
+        backend.rumble(controllerId, durationMs, intensity)
+    }
 }
 
 internal interface DesktopGamepadBackend {
@@ -33,4 +39,6 @@ internal interface DesktopGamepadBackend {
 
 
     fun rumble(durationMs: Int, intensity: Float) {}
+
+    fun rumble(controllerId: String, durationMs: Int, intensity: Float) {}
 }

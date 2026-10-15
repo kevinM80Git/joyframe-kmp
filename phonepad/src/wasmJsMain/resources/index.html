@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#102730">
+<title>Controller</title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#102730;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none}
+#pad{position:fixed;inset:0}
+#wait{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#82ead0;font:800 18px system-ui,-apple-system,Roboto,sans-serif;letter-spacing:2px}
+#turn{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:#102730;color:#82ead0;font:800 22px system-ui,sans-serif;z-index:9}
+@media (orientation:portrait){#turn{display:flex}}
+</style>
+<script>
+// Joyframe's Compose controller needs WebAssembly GC; older browsers get the light HTML controller.
+(function(){
+  // A module with one GC struct type: valid only where WebAssembly GC is supported.
+  var gc = new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,95,1,120,0]);
+  var ok = typeof WebAssembly === 'object' && typeof WebAssembly.validate === 'function' && WebAssembly.validate(gc);
+  if (!ok) location.replace('/lite');
+})();
+// Full screen and landscape on the first touch (Android browsers).
+document.addEventListener('pointerdown', function(){
+  var d = document.documentElement;
+  if (d.requestFullscreen && !document.fullscreenElement) d.requestFullscreen().then(function(){ try { screen.orientation.lock('landscape') } catch(e){} }).catch(function(){});
+}, {capture:true});
+document.addEventListener('touchmove', function(e){ e.preventDefault() }, {passive:false});
+document.addEventListener('contextmenu', function(e){ e.preventDefault() });
+</script>
+</head>
+<body>
+<div id="wait">LOADING CONTROLLER…</div>
+<div id="pad"></div>
+<div id="turn">Turn your phone sideways</div>
+<script src="phonepad.js"></script>
+</body>
+</html>

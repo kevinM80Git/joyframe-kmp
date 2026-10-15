@@ -32,6 +32,9 @@ kotlin {
         }
         commonTest.dependencies { implementation(kotlin("test")) }
         val glMain by creating { dependsOn(commonMain.get()) }
+        // JVM code shared by desktop and Android (sockets: PhonePads).
+        val jvmSharedMain by creating { dependsOn(commonMain.get()) }
+        androidMain.get().dependsOn(jvmSharedMain)
         val iosMain by creating {
             dependsOn(commonMain.get())
         }
@@ -41,6 +44,7 @@ kotlin {
         wasmJsMain.get().dependsOn(glMain)
         val desktopMain by getting {
             dependsOn(glMain)
+            dependsOn(jvmSharedMain)
             dependencies {
                 implementation("org.jetbrains.compose.desktop:desktop:1.11.1")
                 implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.11.0")

@@ -85,7 +85,11 @@ internal interface GlApi {
     fun disableColorBuffers()
 
     fun drawElements(mode: Int, count: Int, type: Int, offsetBytes: Int)
+    fun drawElementsInstanced(mode: Int, count: Int, type: Int, offsetBytes: Int, instances: Int)
+    fun vertexAttribDivisor(index: Int, divisor: Int)
     fun drawArrays(mode: Int, first: Int, count: Int)
+    /** Blocks until the GPU has finished every command issued so far (diagnostics only). */
+    fun finish()
 }
 
 internal object GlConst {
@@ -118,6 +122,7 @@ internal object GlConst {
     const val ELEMENT_ARRAY_BUFFER = 0x8893
     const val STATIC_DRAW = 0x88E4
     const val DYNAMIC_DRAW = 0x88E8
+    const val STREAM_DRAW = 0x88E0
 
     const val FLOAT = 0x1406
     const val UNSIGNED_INT = 0x1405

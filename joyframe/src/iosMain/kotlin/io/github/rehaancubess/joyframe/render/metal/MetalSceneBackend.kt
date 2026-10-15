@@ -82,11 +82,12 @@ private const val TEXTURE_SHADOW = 0uL
 private const val TEXTURE_ALBEDO = 1uL
 
 private const val FRAME_UNIFORM_FLOATS = 68 +
-    WaterConfig.SWELL_TRAINS * WaterConfig.FLOATS_PER_TRAIN + 7 * 4 + 6 * 4 + 4
+    WaterConfig.SWELL_TRAINS * WaterConfig.FLOATS_PER_TRAIN + 7 * 4 + 6 * 4 + 4 + 4
 
-private const val DRAW_UNIFORM_FLOATS = 44 + 4
-private const val SKY_UNIFORM_FLOATS = 24
-private const val FLOATS_PER_VERTEX = 8
+private const val DRAW_UNIFORM_FLOATS = 44 + 4 + 4
+private const val SKY_UNIFORM_FLOATS = 48
+/** position 3, normal 3, uv 2, colour 4 (matches the packed Metal `Vertex`). */
+private const val FLOATS_PER_VERTEX = 12
 
 private const val SHADOW_MAP_SIZE = 2048uL
 
@@ -129,6 +130,9 @@ internal class MetalSceneBackend private constructor(
     private val frameUniforms = FloatArray(FRAME_UNIFORM_FLOATS)
     private val drawUniforms = FloatArray(DRAW_UNIFORM_FLOATS)
     private val skyUniforms = FloatArray(SKY_UNIFORM_FLOATS)
+    private var gradeSaturation = 1.24f
+    private var gradeContrast = 0.20f
+    private var gradeFogResistance = 0f
 
     private val viewMatrix = FloatArray(Mat.SIZE)
     private val projectionMatrix = FloatArray(Mat.SIZE)
@@ -178,6 +182,11 @@ internal class MetalSceneBackend private constructor(
             vertexData[base + 5] = normal.z
             vertexData[base + 6] = uv?.x ?: 0f
             vertexData[base + 7] = uv?.y ?: 0f
+            val color = mesh.colors.getOrNull(i)
+            vertexData[base + 8] = color?.red ?: 1f
+            vertexData[base + 9] = color?.green ?: 1f
+            vertexData[base + 10] = color?.blue ?: 1f
+            vertexData[base + 11] = color?.alpha ?: 1f
         }
         val indexData = IntArray(mesh.indices.size) { mesh.indices[it] }
 
@@ -344,6 +353,9 @@ internal class MetalSceneBackend private constructor(
         cursor = frameUniforms.putColor(cursor, fill?.color ?: PackedColor.Black, fill?.intensity ?: 0f)
 
         val environment = frame.environment
+        gradeSaturation = environment.saturation
+        gradeContrast = environment.contrast
+        gradeFogResistance = environment.emissiveFogResistance
         cursor = frameUniforms.putColor(cursor, environment.ambientColor, environment.ambientIntensity)
         cursor = frameUniforms.putColor(cursor, environment.fogColor, 1f)
         cursor = frameUniforms.putVec4(cursor, environment.fogStart, environment.fogEnd, FOG_MAX_DENSITY, 0f)
@@ -418,7 +430,8 @@ internal class MetalSceneBackend private constructor(
             cursor, surge.deathX, surge.deathZ, surge.deathEnvelope, vortex.deathIntensity,
         )
 
-        frameUniforms.putVec4(cursor, timeSeconds, 0f, 0f, 0f)
+        cursor = frameUniforms.putVec4(cursor, timeSeconds, 0f, 0f, 0f)
+        frameUniforms.putVec4(cursor, gradeSaturation, gradeContrast, gradeFogResistance, 0f)
     }
 
 
@@ -460,9 +473,17 @@ internal class MetalSceneBackend private constructor(
         cursor = skyUniforms.putVec4(cursor, forward.x, forward.y, forward.z, tanHalfFov)
         cursor = skyUniforms.putVec4(cursor, right.x, right.y, right.z, aspect)
         cursor = skyUniforms.putVec4(cursor, up.x, up.y, up.z, frame.renderTimeSeconds)
-        cursor = skyUniforms.putColor(cursor, SKY_ZENITH, 1f)
-        cursor = skyUniforms.putColor(cursor, SKY_HORIZON, 1f)
-        skyUniforms.putColor(cursor, SKY_CLOUD, 1f)
+        val env = frame.environment
+        cursor = skyUniforms.putVec4(cursor, env.skyZenith.red, env.skyZenith.green, env.skyZenith.blue, env.skySun)
+        cursor = skyUniforms.putVec4(cursor, env.skyHorizon.red, env.skyHorizon.green, env.skyHorizon.blue, 1f)
+        cursor = skyUniforms.putVec4(cursor, env.skyCloud.red, env.skyCloud.green, env.skyCloud.blue, env.skyClouds)
+        val moon = env.moonDirection
+        cursor = skyUniforms.putVec4(cursor, moon.x, moon.y, moon.z, env.moonRadius)
+        cursor = skyUniforms.putVec4(cursor, env.moonColor.red, env.moonColor.green, env.moonColor.blue, env.moonGlow)
+        cursor = skyUniforms.putVec4(cursor, env.skyStars, 0f, 0f, 0f)
+        cursor = skyUniforms.putVec4(cursor, 0f, 0f, 0f, env.skyline)
+        cursor = skyUniforms.putVec4(cursor, env.skylineColor.red, env.skylineColor.green, env.skylineColor.blue, 1f)
+        skyUniforms.putVec4(cursor, env.skylineLights.red, env.skylineLights.green, env.skylineLights.blue, 1f)
     }
 
     private fun obtain(): DrawItem {
@@ -510,6 +531,7 @@ internal class MetalSceneBackend private constructor(
                     val item = obtain()
                     val albedo = material.albedo?.let(uploaded.textures::get)
                     item.fill(mesh, primitive, material, albedo, hitFlash, opacity, castsShadow, sortDepth)
+                    if (material.tintable && instance.tint != PackedColor.White) item.applyTint(instance.tint)
                     item.inView = inView || material.waterShade > 0f || instance.kind == InstanceKind.Effect
                     item.foamAge = foamAge
                     partModel.copyInto(item.model)
@@ -632,10 +654,12 @@ internal class MetalSceneBackend private constructor(
             item.roughness, item.metallic, item.receivesShadow,
             if (item.albedo != null) 1f else 0f,
         )
-        drawUniforms.putVec4(
+        cursor = drawUniforms.putVec4(
             cursor, item.waterShade, if (item.isVortex) 1f else 0f,
             if (item.isFoam) 1f else 0f, item.foamAge,
         )
+        drawUniforms.putVec4(cursor, if (item.emissiveFromVertexColor) 1f else 0f,
+            if (item.emissiveFromAlbedo && item.albedo != null) 1f else 0f, if (item.emissiveMask) 1f else 0f, 0f)
     }
 
     companion object {
@@ -655,9 +679,6 @@ internal class MetalSceneBackend private constructor(
 
         private const val FRAME_SHADOW_STRENGTH_INDEX = Mat.SIZE * 2 + 4 * 8 + 2
 
-        private val SKY_ZENITH = PackedColor(0xff4bb8f8.toInt())
-        private val SKY_HORIZON = PackedColor(0xffeaf8ff.toInt())
-        private val SKY_CLOUD = PackedColor(0xfffdfeff.toInt())
 
         private val IDENTITY_TRANSFORM = Transform3D()
 
@@ -801,6 +822,8 @@ private class DrawItem {
     var green = 1f
     var blue = 1f
     var alpha = 1f
+    var emissiveFromVertexColor = false
+    var emissiveFromAlbedo = false
     var emissiveRed = 0f
     var emissiveGreen = 0f
     var emissiveBlue = 0f
@@ -817,6 +840,14 @@ private class DrawItem {
     var isFoam = false
     var isBubble = false
     var foamAge = 0f
+    var emissiveMask = false
+
+    /** The instance tint, applied to this draw's own uniforms (Metal draws one instance at a time). */
+    fun applyTint(tint: PackedColor) {
+        val r = tint.red; val g = tint.green; val b = tint.blue
+        red *= r; green *= g; blue *= b
+        emissiveRed *= r; emissiveGreen *= g; emissiveBlue *= b
+    }
 
     fun fill(
         mesh: MetalMesh,
@@ -849,6 +880,7 @@ private class DrawItem {
         emissiveGreen = ((emissive.argb ushr 8) and 0xff) / 255f * strength + flashGlow
         emissiveBlue = (emissive.argb and 0xff) / 255f * strength + flashGlow
 
+        emissiveMask = material.emissiveMaskFromVertexAlpha
         roughness = material.roughness
         metallic = material.metallic
         receivesShadow = if (strength > 0.001f) 0f else 1f
@@ -868,6 +900,8 @@ private class DrawItem {
         isVortex = material.isVortex
         isFoam = material.isFoam
         isBubble = material.isBubble
+        emissiveFromVertexColor = material.emissiveFromVertexColor
+        emissiveFromAlbedo = material.emissiveFromAlbedo
     }
 }
 

@@ -160,10 +160,16 @@ internal class LwjglGl : GlApi {
         GL33C.glReadBuffer(GL33C.GL_NONE)
     }
 
+    override fun drawElementsInstanced(mode: Int, count: Int, type: Int, offsetBytes: Int, instances: Int) =
+        GL33C.glDrawElementsInstanced(mode, count, type, offsetBytes.toLong(), instances)
+
+    override fun vertexAttribDivisor(index: Int, divisor: Int) = GL33C.glVertexAttribDivisor(index, divisor)
+
     override fun drawElements(mode: Int, count: Int, type: Int, offsetBytes: Int) =
         GL33C.glDrawElements(mode, count, type, offsetBytes.toLong())
 
     override fun drawArrays(mode: Int, first: Int, count: Int) = GL33C.glDrawArrays(mode, first, count)
+    override fun finish() = GL33C.glFinish()
 
 
     fun dispose() {

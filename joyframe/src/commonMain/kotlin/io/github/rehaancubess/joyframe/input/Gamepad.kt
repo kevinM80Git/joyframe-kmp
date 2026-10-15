@@ -57,6 +57,11 @@ expect object PlatformGamepad {
     fun rumbleTest()
     /** Best effort. Unsupported devices/platforms are a no-op; see the support matrix. */
     fun rumble(durationMs: Int, intensity: Float)
+    /**
+     * Rumbles one controller by its [ConnectedGamepad.id] (local multiplayer: each player feels their
+     * own car). Best effort, like [rumble]: Android and browsers; a no-op where unsupported.
+     */
+    fun rumble(controllerId: String, durationMs: Int, intensity: Float)
 }
 data class GamepadOptions(
     val deadzone: Float = .15f,

@@ -43,6 +43,20 @@ data class GpuMaterial(
     val isFoam: Boolean = false,
 
     val isBubble: Boolean = false,
+    /** Glow colour comes from each vertex's colour (times [emissiveStrength]): one material, any neon. */
+    val emissiveFromVertexColor: Boolean = false,
+    /** Glow is also multiplied by the [albedo] texture: lit text and signs from one atlas. */
+    val emissiveFromAlbedo: Boolean = false,
+    /**
+     * Takes the instance's [SceneInstance.tint] (base colour and glow). Off for parts that must keep
+     * their own colour inside a tinted model (a car's dark cabin, white headlights).
+     */
+    val tintable: Boolean = true,
+    /**
+     * Opaque materials only: the glow is masked by each vertex's alpha (0 = no glow, 1 = full), so
+     * lit surfaces and light strips can share one mesh and one draw (a car's paint and its neon lines).
+     */
+    val emissiveMaskFromVertexAlpha: Boolean = false,
 ) {
     init {
         require(waterShade in 0f..1f) { "$id: waterShade $waterShade outside [0, 1]" }
@@ -83,9 +97,16 @@ data class IndexedMesh(
     val indices: List<Int>,
     val primitives: List<MeshPrimitive>,
     val bounds: Bounds3,
+    /**
+     * Optional per-vertex colour, multiplied into the material's base colour (and its glow when the
+     * material sets [GpuMaterial.emissiveFromVertexColor]). Empty means white. Lets one material
+     * draw many colours, so a whole chunk of scenery can be a single draw.
+     */
+    val colors: List<PackedColor> = emptyList(),
 ) {
     init {
         require(positions.size == normals.size) { "$id: position/normal count mismatch" }
+        require(colors.isEmpty() || colors.size == positions.size) { "$id: position/colour count mismatch" }
         require(textureCoordinates.isEmpty() || textureCoordinates.size == positions.size) {
             "$id: position/UV count mismatch"
         }
@@ -168,8 +189,25 @@ data class SceneInstance(
 
 
     val foamAge: Float = 0f,
+
+    /**
+     * Multiplies the base colour and glow of every part whose material is [GpuMaterial.tintable]:
+     * one white material, any number of colours. Instances that differ only by tint (and transform)
+     * share a material and can be drawn together in one instanced draw.
+     */
+    val tint: PackedColor = PackedColor.White,
 ) {
-    fun interpolatedTransform(): Transform3D = previousTransform.interpolateTo(transform, interpolationAlpha)
+    fun interpolatedTransform(): Transform3D =
+        // Nothing to blend (statics, effects placed this frame): no new transform.
+        if (previousTransform === transform || interpolationAlpha >= 1f) transform
+        else previousTransform.interpolateTo(transform, interpolationAlpha)
+
+    /**
+     * Renderer scratch: a static instance's final per-part matrices, computed once (instances are
+     * immutable, and a game reuses its static ones frame after frame). Not part of equality.
+     */
+    internal var gpuPartMatrices: Array<FloatArray>? = null
+    internal var gpuMatricesFor: Any? = null
 }
 
 data class GpuCamera(
@@ -195,7 +233,45 @@ data class SceneEnvironment(
     val fogColor: PackedColor = PackedColor(0xffd9f3fc.toInt()),
     val fogStart: Float = 1_800f,
     val fogEnd: Float = 6_200f,
-)
+    /** Sky gradient drawn behind the scene: straight up, at the horizon, and the cloud tint. */
+    val skyZenith: PackedColor = PackedColor(0xff4bb8f8.toInt()),
+    val skyHorizon: PackedColor = PackedColor(0xffeaf8ff.toInt()),
+    val skyCloud: PackedColor = PackedColor(0xfffdfeff.toInt()),
+    /** Strength of the built-in sun disc and halo, 0 to hide it (a night sky). */
+    val skySun: Float = 1f,
+    /** Cloud cover, 0..1. At 0 the per-pixel cloud noise is skipped entirely, which saves fill rate. */
+    val skyClouds: Float = 1f,
+    /** Colour grade after exposure: saturation (1 = neutral) and an S-curve contrast blend (0 = none). */
+    val saturation: Float = 1.24f,
+    val contrast: Float = 0.20f,
+    /**
+     * How much glow punches through fog, 0..1: 0 fogs emissive like everything else; 1 keeps neon at
+     * full strength at any distance (the fog still hides the unlit surfaces around it).
+     */
+    val emissiveFogResistance: Float = 0f,
+    /** Star field brightness above the horizon, 0 to skip it (no per-pixel cost). */
+    val skyStars: Float = 0f,
+    /** A moon (or planet) disc in the sky: direction toward it, angular radius in radians, colour and glow; [moonGlow] 0 hides it. */
+    val moonDirection: Vec3 = Vec3(0f, 0.3f, -1f),
+    val moonRadius: Float = 0.06f,
+    val moonColor: PackedColor = PackedColor(0xfff2ecff.toInt()),
+    val moonGlow: Float = 0f,
+    /**
+     * A distant city silhouette around the horizon, drawn by the sky pass (no geometry, never cut by
+     * the far plane): [skyline] is its opacity (0 skips it), [skylineColor] the near layer (a hazier
+     * far layer blends toward the horizon), [skylineLights] the colour of its sparse windows.
+     */
+    val skyline: Float = 0f,
+    val skylineColor: PackedColor = PackedColor(0xff0a0816.toInt()),
+    val skylineLights: PackedColor = PackedColor(0xffffc890.toInt()),
+) {
+    init {
+        require(skySun.isFinite() && skySun >= 0f) { "skySun must be finite and non-negative" }
+        require(skyClouds.isFinite() && skyClouds in 0f..1f) { "skyClouds must be in 0..1" }
+        require(emissiveFogResistance in 0f..1f) { "emissiveFogResistance must be in 0..1" }
+        require(saturation.isFinite() && saturation >= 0f) { "saturation must be finite and non-negative" }
+    }
+}
 
 data class GpuSceneAssets(
     val cacheKey: String,

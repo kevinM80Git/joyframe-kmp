@@ -75,6 +75,11 @@ actual object PlatformGamepad {
         if (!GamepadTuning.current.gamepadRumbleEnabled) return
     }
 
+    /** Not yet on iOS (Core Haptics per controller): a no-op. */
+    actual fun rumble(controllerId: String, durationMs: Int, intensity: Float) {
+        if (!GamepadTuning.current.gamepadRumbleEnabled) return
+    }
+
 
     private fun trigger(value: Float): Float = if (value < TRIGGER_DEADZONE) 0f else value
 

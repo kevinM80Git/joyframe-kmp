@@ -35,6 +35,9 @@ object TiltMath {
     /** Ignores the hand's natural drift; below this the vehicle holds its line. */
     const val DEAD_ZONE = .08f
 
+    /** Share of the way to each new reading the reported steer moves (a one-pole low-pass). */
+    const val SMOOTHING = .3f
+
     /** Roll about the axis through the screen, in radians, from in-plane gravity. */
     fun roll(gravityX: Double, gravityY: Double): Float = kotlin.math.atan2(gravityX, gravityY).toFloat()
 
@@ -65,7 +68,10 @@ internal class TiltTracker {
         if (!gravityX.isFinite() || !gravityY.isFinite()) return
         val roll = TiltMath.roll(gravityX, gravityY)
         if (neutral.isNaN()) { neutral = roll; steer = 0f; return }
-        steer = TiltMath.steer(roll, neutral, fullLockDegrees)
+        // Accelerometers are noisy and hands shake: a short low-pass (about 50 ms at the usual 60
+        // readings a second) steadies the wheel without a lag anyone feels.
+        val target = TiltMath.steer(roll, neutral, fullLockDegrees)
+        steer = if (target == 0f && kotlin.math.abs(steer) < .02f) 0f else steer + (target - steer) * TiltMath.SMOOTHING
     }
 
     fun recenter() { neutral = Float.NaN; steer = 0f }

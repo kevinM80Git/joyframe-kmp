@@ -106,7 +106,10 @@ private const val MSAA_SAMPLES = 4
 private class MultisampleConfigChooser(private val samples: Int) : GLSurfaceView.EGLConfigChooser {
     override fun chooseConfig(egl: EGL10, display: EGLDisplay): EGLConfig {
         if (samples > 1) {
-            first(egl, display, intArrayOf(EGL10.EGL_SAMPLE_BUFFERS, 1, EGL10.EGL_SAMPLES, samples))?.let { return it }
+            first(egl, display, intArrayOf(EGL10.EGL_SAMPLE_BUFFERS, 1, EGL10.EGL_SAMPLES, samples))?.let {
+                Log.i("Joyframe", "${samples}x MSAA")
+                return it
+            }
             Log.w("Joyframe", "No ${samples}x MSAA config; drawing without antialiasing")
         }
         return checkNotNull(first(egl, display, intArrayOf())) { "No OpenGL ES 3 config" }

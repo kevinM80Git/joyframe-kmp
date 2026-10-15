@@ -12,7 +12,7 @@ import javax.sound.sampled.FloatControl
 
 
 internal actual fun createAudioBackend(bank: AudioBank): AudioBackend = DesktopAudio(bank)
-private val audioDeviceLock = Any()
+internal val audioDeviceLock = Any()
 private class DesktopAudio(bank: AudioBank) : AudioBackend {
     private val mixer: DesktopMixer = if (
         System.getProperty("os.name").contains("mac", ignoreCase = true)

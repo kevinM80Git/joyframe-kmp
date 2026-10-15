@@ -2,6 +2,8 @@
 package io.github.rehaancubess.joyframe.render.gl
 
 import io.github.rehaancubess.joyframe.render.PaneRect
+import io.github.rehaancubess.joyframe.render.RenderDiagnostics
+import io.github.rehaancubess.joyframe.render.RenderStats
 import io.github.rehaancubess.joyframe.render.SplitLayout
 import io.github.rehaancubess.joyframe.render.gpu.GpuBlendMode
 import io.github.rehaancubess.joyframe.render.gpu.GpuCullMode
@@ -23,9 +25,15 @@ import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.sqrt
 import kotlin.math.tan
+import kotlin.time.TimeSource
 
-private const val FLOATS_PER_VERTEX = 8
+/** position 3, normal 3, uv 2, colour 4. */
+private const val FLOATS_PER_VERTEX = 12
 private const val VERTEX_STRIDE_BYTES = FLOATS_PER_VERTEX * 4
+
+/** Per instance: model matrix 16, normal matrix columns 3 × 4, tint 4. */
+private const val FLOATS_PER_INSTANCE = 32
+private const val INSTANCE_STRIDE_BYTES = FLOATS_PER_INSTANCE * 4
 
 private const val SHADOW_MAP_SIZE = 2048
 
@@ -57,17 +65,51 @@ internal class GlAssets(
     val cacheKey: String,
     val meshes: Map<String, GlMesh>,
     val textures: Map<String, Int>,
-)
+) {
+    /** Models resolved to meshes, local matrices and materials, once per asset set (by model id). */
+    private val resolved = HashMap<String, ResolvedModel?>()
+
+    fun resolve(id: String, assets: GpuSceneAssets): ResolvedModel? = resolved.getOrPut(id) {
+        val model = assets.models[id] ?: return@getOrPut null
+        ResolvedModel(model.parts.mapNotNull { part ->
+            val mesh = meshes[part.meshId] ?: return@mapNotNull null
+            val identity = part.localTransform == Transform3D()
+            val lm = if (identity) null else FloatArray(Mat.SIZE)
+            val ln = if (identity) null else FloatArray(Mat.SIZE)
+            if (!identity) Mat.compose(part.localTransform, lm!!, ln!!)
+            ResolvedPart(mesh, identity, lm, ln, part.materialSlot, mesh.primitives.map { p ->
+                val material = assets.materials[p.materialId]
+                ResolvedPrimitive(p, material, material?.albedo?.let { textures[it] } ?: 0)
+            }.toTypedArray())
+        }.toTypedArray())
+    }
+}
+
+internal class ResolvedModel(val parts: Array<ResolvedPart>)
+internal class ResolvedPart(val mesh: GlMesh, val identity: Boolean, val localModel: FloatArray?, val localNormal: FloatArray?,
+                            val materialSlot: String?, val primitives: Array<ResolvedPrimitive>)
+internal class ResolvedPrimitive(val primitive: GlPrimitive, val material: GpuMaterial?, val albedo: Int)
 
 internal class GlSceneBackend private constructor(
     private val gl: GlApi,
     private val scene: SceneProgram,
+    /** Lean variants (no water, vortex or foam), without and with shadow sampling; null if they failed to link. */
+    private val litePlain: SceneProgram?,
+    private val liteShadow: SceneProgram?,
     private val shadow: ShadowProgram,
     private val sky: SkyProgram,
-    private val shadowFramebuffer: Int,
-    private val shadowTexture: Int,
     private val whiteTexture: Int,
+    private val instanceBuffer: Int,
 ) {
+    /** This pane's instance records (all batches), uploaded once before the draws. */
+    private var instanceData = FloatArray(FLOATS_PER_INSTANCE * 256)
+    private var instanceCapacityBytes = 0
+    private val batchStart = IntArray(4096)
+    private val batchCount = IntArray(4096)
+    private val batchFirst = ArrayList<DrawItem>()
+    private val additiveDraws = ArrayList<DrawItem>()
+    private val byBatchKey = Comparator<DrawItem> { a, b -> a.batchKey.compareTo(b.batchKey) }
+
     private val viewMatrix = FloatArray(Mat.SIZE)
     private val projectionMatrix = FloatArray(Mat.SIZE)
     private val viewProjectionMatrix = FloatArray(Mat.SIZE)
@@ -82,6 +124,43 @@ internal class GlSceneBackend private constructor(
     private val localNormal = FloatArray(Mat.SIZE)
 
     private val frame = FrameState()
+
+    // The shadow map (a 2048² depth texture, 16 MB) is made the first time a frame casts shadows:
+    // scenes without a shadow-casting light (blob shadows, as on Fire TV) never pay for it.
+    private var shadowFramebuffer = 0
+    private var shadowTexture = 0
+    private var shadowsUnavailable = false
+
+    private fun ensureShadowMap(): Boolean {
+        if (shadowTexture != 0) return true
+        if (shadowsUnavailable) return false
+        val texture = gl.genTexture()
+        gl.bindTexture(GlConst.TEXTURE_2D, texture)
+        gl.texImage2DDepth(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE)
+        gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_MIN_FILTER, GlConst.LINEAR)
+        gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_MAG_FILTER, GlConst.LINEAR)
+        gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_WRAP_S, GlConst.CLAMP_TO_EDGE)
+        gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_WRAP_T, GlConst.CLAMP_TO_EDGE)
+        gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_COMPARE_MODE, GlConst.COMPARE_REF_TO_TEXTURE)
+        gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_COMPARE_FUNC, GlConst.LESS)
+        boundAlbedo = -1
+        val framebuffer = gl.genFramebuffer()
+        gl.bindFramebuffer(framebuffer)
+        gl.framebufferDepthTexture(texture)
+        gl.disableColorBuffers()
+        val complete = gl.framebufferComplete()
+        gl.bindFramebuffer(0)
+        if (!complete) {
+            println("GL: shadow framebuffer incomplete; drawing without shadow maps")
+            gl.deleteFramebuffer(framebuffer)
+            gl.deleteTexture(texture)
+            shadowsUnavailable = true
+            return false
+        }
+        shadowFramebuffer = framebuffer
+        shadowTexture = texture
+        return true
+    }
 
 
     private val swellScratch = FloatArray(WaterConfig.SWELL_TRAINS * WaterConfig.FLOATS_PER_TRAIN)
@@ -125,6 +204,11 @@ internal class GlSceneBackend private constructor(
             vertexData[base + 5] = normal.z
             vertexData[base + 6] = uv?.x ?: 0f
             vertexData[base + 7] = uv?.y ?: 0f
+            val color = mesh.colors.getOrNull(i)
+            vertexData[base + 8] = color?.red ?: 1f
+            vertexData[base + 9] = color?.green ?: 1f
+            vertexData[base + 10] = color?.blue ?: 1f
+            vertexData[base + 11] = color?.alpha ?: 1f
         }
         val indexData = IntArray(mesh.indices.size) { mesh.indices[it] }
 
@@ -145,6 +229,17 @@ internal class GlSceneBackend private constructor(
         gl.vertexAttribPointer(GlShaders.ATTRIB_NORMAL, 3, GlConst.FLOAT, false, VERTEX_STRIDE_BYTES, 12)
         gl.enableVertexAttribArray(GlShaders.ATTRIB_TEXCOORD)
         gl.vertexAttribPointer(GlShaders.ATTRIB_TEXCOORD, 2, GlConst.FLOAT, false, VERTEX_STRIDE_BYTES, 24)
+        gl.enableVertexAttribArray(GlShaders.ATTRIB_VERTEX_COLOR)
+        gl.vertexAttribPointer(GlShaders.ATTRIB_VERTEX_COLOR, 4, GlConst.FLOAT, false, VERTEX_STRIDE_BYTES, 32)
+
+        // Per-instance attributes from the shared instance buffer; each batch re-points them at its records.
+        gl.bindBuffer(GlConst.ARRAY_BUFFER, instanceBuffer)
+        ensureInstanceCapacity(INSTANCE_STRIDE_BYTES * 64)
+        for (attribute in GlShaders.ATTRIB_INSTANCE_MODEL..GlShaders.ATTRIB_INSTANCE_TINT) {
+            gl.enableVertexAttribArray(attribute)
+            gl.vertexAttribDivisor(attribute, 1)
+        }
+        pointInstances(0)
 
         gl.bindVertexArray(0)
         boundVertexArray = 0
@@ -157,6 +252,26 @@ internal class GlSceneBackend private constructor(
             boundsCenter = (mesh.bounds.minimum + mesh.bounds.maximum) * 0.5f,
             boundsRadius = (mesh.bounds.maximum - mesh.bounds.minimum).length() * 0.5f,
         )
+    }
+
+    /** The bound vertex array's per-instance attributes start at byte [offset] of the instance buffer. */
+    private fun pointInstances(offset: Int) {
+        for (column in 0 until 4) {
+            gl.vertexAttribPointer(GlShaders.ATTRIB_INSTANCE_MODEL + column, 4, GlConst.FLOAT, false, INSTANCE_STRIDE_BYTES, offset + column * 16)
+        }
+        for (column in 0 until 3) {
+            gl.vertexAttribPointer(GlShaders.ATTRIB_INSTANCE_NORMAL + column, 4, GlConst.FLOAT, false, INSTANCE_STRIDE_BYTES, offset + 64 + column * 16)
+        }
+        gl.vertexAttribPointer(GlShaders.ATTRIB_INSTANCE_TINT, 4, GlConst.FLOAT, false, INSTANCE_STRIDE_BYTES, offset + 112)
+    }
+
+    /** With the instance buffer bound: grows it to at least [bytes] (contents are rewritten every pane). */
+    private fun ensureInstanceCapacity(bytes: Int) {
+        if (bytes <= instanceCapacityBytes) return
+        var capacity = maxOf(instanceCapacityBytes, INSTANCE_STRIDE_BYTES * 64)
+        while (capacity < bytes) capacity *= 2
+        gl.bufferStorage(GlConst.ARRAY_BUFFER, capacity, GlConst.STREAM_DRAW)
+        instanceCapacityBytes = capacity
     }
 
     private fun upload(texture: TextureData): Int {
@@ -194,8 +309,10 @@ internal class GlSceneBackend private constructor(
         val height = heightPixels.coerceAtLeast(1)
         val area = pane ?: PaneRect(0, 0, width, height)
         val uploaded = assetsFor(source.assets)
+        val prepared = TimeSource.Monotonic.markNow()
         buildFrameState(source, area.aspect)
         collectDraws(source, uploaded)
+        statPrepareMicros += prepared.elapsedNow().inWholeMicroseconds
         boundVertexArray = -1
         currentCull = Int.MIN_VALUE
         currentBlend = null
@@ -213,6 +330,21 @@ internal class GlSceneBackend private constructor(
      */
     fun renderPanes(frames: List<GpuSceneFrame>, widthPixels: Int, heightPixels: Int, gutter: PackedColor,
                     gapPixels: Int, targetFramebuffer: Int = 0) {
+        val started = TimeSource.Monotonic.markNow()
+        resetStats()
+        renderPaneList(frames, widthPixels, heightPixels, gutter, gapPixels, targetFramebuffer)
+        val submit = started.elapsedNow().inWholeMicroseconds / 1000f
+        var gpuWait = -1f
+        if (RenderDiagnostics.syncGpu) {
+            val issued = TimeSource.Monotonic.markNow()
+            gl.finish()
+            gpuWait = issued.elapsedNow().inWholeMicroseconds / 1000f
+        }
+        publishStats(frames.size, submit, gpuWait)
+    }
+
+    private fun renderPaneList(frames: List<GpuSceneFrame>, widthPixels: Int, heightPixels: Int, gutter: PackedColor,
+                               gapPixels: Int, targetFramebuffer: Int) {
         if (frames.size <= 1) {
             frames.firstOrNull()?.let { render(it, widthPixels, heightPixels, targetFramebuffer) }
             return
@@ -228,6 +360,30 @@ internal class GlSceneBackend private constructor(
         SplitLayout.panes(frames.size, width, height, gapPixels).forEachIndexed { index, rect ->
             render(frames[index], width, height, targetFramebuffer, pane = rect.flippedY(height))
         }
+    }
+
+    private var statDrawCalls = 0
+    private var statShadowDrawCalls = 0
+    private var statTriangles = 0
+    private var statInstancesDrawn = 0
+    private var statInstancesCulled = 0
+    private var statInstancesBatched = 0
+    private var statFrame = 0L
+
+    private var statPrepareMicros = 0L
+    private var statLiteDraws = 0
+
+    private fun resetStats() {
+        statPrepareMicros = 0L
+        statLiteDraws = 0
+        statDrawCalls = 0; statShadowDrawCalls = 0; statTriangles = 0
+        statInstancesDrawn = 0; statInstancesCulled = 0; statInstancesBatched = 0
+    }
+
+    private fun publishStats(panes: Int, submitMillis: Float, gpuWaitMillis: Float = -1f) {
+        RenderDiagnostics.latest = RenderStats(++statFrame, submitMillis, panes, statDrawCalls,
+            statShadowDrawCalls, statTriangles, statInstancesDrawn, statInstancesCulled, statInstancesBatched,
+            statPrepareMicros / 1000f, gpuWaitMillis, statLiteDraws)
     }
 
     private fun buildFrameState(source: GpuSceneFrame, aspect: Float) {
@@ -260,7 +416,10 @@ internal class GlSceneBackend private constructor(
         val environment = source.environment
         frame.setAmbient(environment.ambientColor, environment.ambientIntensity)
         frame.setFog(environment.fogColor, environment.fogStart, environment.fogEnd)
-        frame.shadowStrength = if (shadowCaster != null) SHADOW_STRENGTH else 0f
+        frame.saturation = environment.saturation
+        frame.contrast = environment.contrast
+        frame.emissiveFogResistance = environment.emissiveFogResistance
+        frame.shadowStrength = if (shadowCaster != null && ensureShadowMap()) SHADOW_STRENGTH else 0f
 
         val forward = (camera.target - camera.eye).normalized()
         var right = forward.cross(camera.up)
@@ -360,47 +519,91 @@ internal class GlSceneBackend private constructor(
         blendedDraws.clear()
 
         val eye = source.camera.eye
-        source.instances.forEach { instance ->
-            if (!instance.visible) return@forEach
-            val model = source.assets.models[instance.modelId] ?: return@forEach
+        val ex = eye.x; val ey = eye.y; val ez = eye.z
+        val instances = source.instances
+        for (n in instances.indices) {
+            val instance = instances[n]
+            if (!instance.visible) continue
+            val resolved = uploaded.resolve(instance.modelId, source.assets) ?: continue
             val hitFlash = instance.hitFlash.coerceIn(0f, 1f)
             val opacity = instance.opacity.coerceIn(0f, 1f)
             val foamAge = instance.foamAge.coerceIn(0f, 1f)
-            val worldTransform = instance.interpolatedTransform()
-            Mat.compose(worldTransform, instanceModel, instanceNormal)
-
-            val toEye = worldTransform.translation - eye
-            val sortDepth = toEye.dot(toEye)
+            val tint = instance.tint
             val castsShadow = instance.kind != InstanceKind.Effect
-
-            model.parts.forEach parts@{ part ->
-                val mesh = uploaded.meshes[part.meshId] ?: return@parts
-                if (part.localTransform == IDENTITY_TRANSFORM) {
-                    instanceModel.copyInto(partModel)
-                    instanceNormal.copyInto(partNormal)
-                } else {
-                    Mat.compose(part.localTransform, localModel, localNormal)
-                    Mat.multiply(instanceModel, localModel, partModel)
-                    Mat.multiply(instanceNormal, localNormal, partNormal)
+            val parts = resolved.parts
+            // Static instances keep their final part matrices (computed once per asset set); the rest
+            // compose theirs here, without allocating when there is nothing to interpolate.
+            val static = instance.kind == InstanceKind.Static
+            var cache = if (static && instance.gpuMatricesFor === resolved) instance.gpuPartMatrices else null
+            if (cache == null) {
+                Mat.compose(instance.interpolatedTransform(), instanceModel, instanceNormal)
+                if (static) {
+                    cache = Array(parts.size * 2) { FloatArray(Mat.SIZE) }
+                    for (i in parts.indices) composePart(parts[i], cache[i * 2], cache[i * 2 + 1])
+                    instance.gpuPartMatrices = cache
+                    instance.gpuMatricesFor = resolved
                 }
-                val inView = instance.kind == InstanceKind.Dynamic || insideFrustum(mesh, partModel)
+            }
+            // Sort depth from the instance origin (the model matrix's translation).
+            val tx: Float; val ty: Float; val tz: Float
+            if (cache != null && parts.isNotEmpty() && parts[0].identity) {
+                val m = cache[0]; tx = m[12]; ty = m[13]; tz = m[14]
+            } else if (cache != null) {
+                // Static with a non-identity first part: recover the instance origin once more.
+                Mat.compose(instance.interpolatedTransform(), instanceModel, instanceNormal)
+                tx = instanceModel[12]; ty = instanceModel[13]; tz = instanceModel[14]
+            } else { tx = instanceModel[12]; ty = instanceModel[13]; tz = instanceModel[14] }
+            val dx = tx - ex; val dy = ty - ey; val dz = tz - ez
+            val sortDepth = dx * dx + dy * dy + dz * dz
+            var anyInView = false
 
-                mesh.primitives.forEach primitives@{ primitive ->
-                    if (primitive.indexCount == 0) return@primitives
-                    val materialId = part.materialSlot?.let(instance.materials::get) ?: primitive.materialId
-                    val material = source.assets.materials[materialId] ?: return@primitives
+            for (i in parts.indices) {
+                val part = parts[i]
+                val model: FloatArray; val normal: FloatArray
+                if (cache != null) { model = cache[i * 2]; normal = cache[i * 2 + 1] }
+                else { composePart(part, partModel, partNormal); model = partModel; normal = partNormal }
+                val mesh = part.mesh
+                val inView = instance.kind == InstanceKind.Dynamic || insideFrustum(mesh, model)
+                if (inView) anyInView = true
+
+                for (primitive in part.primitives) {
+                    if (primitive.primitive.indexCount == 0) continue
+                    val material: GpuMaterial
+                    val albedo: Int
+                    val slot = part.materialSlot
+                    val override = if (slot != null) instance.materials[slot] else null
+                    if (override != null) {
+                        material = source.assets.materials[override] ?: continue
+                        albedo = material.albedo?.let { uploaded.textures[it] } ?: 0
+                    } else {
+                        material = primitive.material ?: continue
+                        albedo = primitive.albedo
+                    }
                     val item = obtain()
-                    val albedo = material.albedo?.let(uploaded.textures::get) ?: 0
-                    item.fill(mesh, primitive, material, albedo, hitFlash, opacity, castsShadow, sortDepth)
+                    item.fill(mesh, primitive.primitive, material, albedo, hitFlash, opacity, castsShadow, sortDepth)
+                    if (material.tintable) item.setTint(tint) else item.setTint(PackedColor.White)
                     item.foamAge = foamAge
                     item.inView = inView
-                    partModel.copyInto(item.model)
-                    partNormal.copyInto(item.normal)
+                    item.isStatic = static
+                    model.copyInto(item.model)
+                    normal.copyInto(item.normal)
                     if (item.blendMode == GpuBlendMode.Opaque) opaqueDraws.add(item) else blendedDraws.add(item)
                 }
             }
+            if (anyInView) statInstancesDrawn++ else statInstancesCulled++
         }
         if (blendedDraws.size > 1) blendedDraws.sortWith(farToNear)
+    }
+
+    /** The instance matrices (in [instanceModel] / [instanceNormal]) times [part]'s local transform. */
+    private fun composePart(part: ResolvedPart, model: FloatArray, normal: FloatArray) {
+        if (part.identity) {
+            instanceModel.copyInto(model)
+            instanceNormal.copyInto(normal)
+        } else {
+            Mat.multiply(instanceModel, part.localModel!!, model)
+            Mat.multiply(instanceNormal, part.localNormal!!, normal)
+        }
     }
 
     private fun renderShadowPass() {
@@ -424,6 +627,7 @@ internal class GlSceneBackend private constructor(
             bindMesh(item.mesh ?: return@forEach)
             gl.uniformMatrix4(shadow.model, item.model)
             gl.drawElements(GlConst.TRIANGLES, item.indexCount, GlConst.UNSIGNED_INT, item.firstIndex * 4)
+            statShadowDrawCalls++
         }
 
         gl.disable(GlConst.POLYGON_OFFSET_FILL)
@@ -448,7 +652,7 @@ internal class GlSceneBackend private constructor(
             currentCull = Int.MIN_VALUE
             currentBlend = null
             boundAlbedo = -1
-        } else {
+        } else if (RenderDiagnostics.skip and RenderDiagnostics.SKIP_SKY == 0) {
         gl.disable(GlConst.DEPTH_TEST)
         gl.depthMask(false)
         gl.disable(GlConst.BLEND)
@@ -457,50 +661,57 @@ internal class GlSceneBackend private constructor(
         gl.uniform4(sky.forward, frame.skyForward.x, frame.skyForward.y, frame.skyForward.z, frame.tanHalfFov)
         gl.uniform4(sky.right, frame.skyRight.x, frame.skyRight.y, frame.skyRight.z, frame.aspect)
         gl.uniform4(sky.up, frame.skyUp.x, frame.skyUp.y, frame.skyUp.z, frame.timeSeconds)
-        gl.uniform4(sky.zenithColor, SKY_ZENITH.red, SKY_ZENITH.green, SKY_ZENITH.blue, 1f)
-        gl.uniform4(sky.horizonColor, SKY_HORIZON.red, SKY_HORIZON.green, SKY_HORIZON.blue, 1f)
-        gl.uniform4(sky.cloudColor, SKY_CLOUD.red, SKY_CLOUD.green, SKY_CLOUD.blue, 1f)
+        val env = source.environment
+        gl.uniform4(sky.zenithColor, env.skyZenith.red, env.skyZenith.green, env.skyZenith.blue, env.skySun)
+        gl.uniform4(sky.horizonColor, env.skyHorizon.red, env.skyHorizon.green, env.skyHorizon.blue, 1f)
+        gl.uniform4(sky.cloudColor, env.skyCloud.red, env.skyCloud.green, env.skyCloud.blue, env.skyClouds)
+        val moon = env.moonDirection
+        gl.uniform4(sky.moon, moon.x, moon.y, moon.z, env.moonRadius)
+        gl.uniform4(sky.moonColor, env.moonColor.red, env.moonColor.green, env.moonColor.blue, env.moonGlow)
+        gl.uniform4(sky.stars, env.skyStars, 0f, 0f, 0f)
+        gl.uniform4(sky.skyline, 0f, 0f, 0f, env.skyline)
+        gl.uniform4(sky.skylineColor, env.skylineColor.red, env.skylineColor.green, env.skylineColor.blue, 1f)
+        gl.uniform4(sky.skylineLights, env.skylineLights.red, env.skylineLights.green, env.skylineLights.blue, 1f)
         bindVertexArray(sky.emptyVertexArray)
         gl.drawArrays(GlConst.TRIANGLES, 0, 3)
+        statDrawCalls++
         }
 
-        gl.useProgram(scene.program)
-        gl.uniform1f(scene.time, frame.timeSeconds)
-        uploadWaterUniforms(source.water, frame.timeSeconds)
-        uploadVortexUniforms(source.vortex, source.vortexSurge)
-        gl.uniformMatrix4(scene.viewProjection, viewProjectionMatrix)
-        gl.uniformMatrix4(scene.lightViewProjection, lightViewProjectionMatrix)
-        gl.uniform4(scene.cameraPosition, frame.cameraPosition.x, frame.cameraPosition.y, frame.cameraPosition.z, 0f)
-        gl.uniform4(scene.lightDirection, frame.keyDirection.x, frame.keyDirection.y, frame.keyDirection.z, 0f)
-        gl.uniform4(scene.lightColor, frame.keyRed, frame.keyGreen, frame.keyBlue, 1f)
-        gl.uniform4(scene.fillDirection, frame.fillDirection.x, frame.fillDirection.y, frame.fillDirection.z, 0f)
-        gl.uniform4(scene.fillColor, frame.fillRed, frame.fillGreen, frame.fillBlue, 1f)
-        gl.uniform4(scene.ambientColor, frame.ambientRed, frame.ambientGreen, frame.ambientBlue, 1f)
-        gl.uniform4(scene.fogColor, frame.fogRed, frame.fogGreen, frame.fogBlue, 1f)
-        gl.uniform4(scene.fogParams, frame.fogStart, frame.fogEnd, FOG_MAX_DENSITY, 0f)
-        gl.uniform4(
-            scene.shadowParams,
-            1f / SHADOW_MAP_SIZE.toFloat(),
-            SHADOW_DEPTH_BIAS,
-            frame.shadowStrength,
-            EXPOSURE,
-        )
-        gl.activeTexture(GlConst.TEXTURE0 + UNIT_SHADOW)
-        gl.bindTexture(GlConst.TEXTURE_2D, shadowTexture)
-        gl.uniform1i(scene.shadowMap, UNIT_SHADOW)
-        gl.uniform1i(scene.albedo, UNIT_ALBEDO)
+        // Batches: opaque by state (order does not matter), alpha in far-to-near runs, additive by
+        // state after the alpha draws (adding is order-independent). One upload, then one draw per batch.
+        val batching = TimeSource.Monotonic.markNow()
+        val batches = buildBatches()
+        statPrepareMicros += batching.elapsedNow().inWholeMicroseconds
+        uploadInstances()
+
+        // The lean program draws everything that is not water, vortex or foam; the full one the rest.
+        val lite = if (RenderDiagnostics.fullShaderOnly) null else if (frame.shadowStrength > 0.001f) liteShadow else litePlain
+        var needFull = lite == null
+        if (!needFull) for (b in 0 until batches) if (needsFull(batchFirst[b])) { needFull = true; break }
+        if (needFull) {
+            gl.useProgram(scene.program)
+            frameUniforms(scene, source)
+        }
+        if (lite != null) {
+            gl.useProgram(lite.program)
+            frameUniforms(lite, source)
+        }
+        var current = if (lite != null) lite else scene
         gl.activeTexture(GlConst.TEXTURE0 + UNIT_ALBEDO)
 
         gl.enable(GlConst.DEPTH_TEST)
         gl.depthFunc(GlConst.LESS)
         gl.depthMask(true)
-        applyBlend(GpuBlendMode.Opaque)
-        opaqueDraws.forEach { if (it.inView) encode(it) }
-        gl.depthMask(false)
-        blendedDraws.forEach { item ->
-            if (!item.inView) return@forEach
+        val skip = RenderDiagnostics.skip
+        for (b in 0 until batches) {
+            val item = batchFirst[b]
+            if (b == opaqueBatches) gl.depthMask(false)
+            if (skip != 0 && (if (b < opaqueBatches) skip and RenderDiagnostics.SKIP_OPAQUE else skip and RenderDiagnostics.SKIP_BLENDED) != 0) continue
+            if (skip and RenderDiagnostics.SKIP_STATIC_BLENDED != 0 && b >= opaqueBatches && item.isStatic) continue
+            val program = if (lite != null && !needsFull(item)) lite else scene
+            if (program !== current) { gl.useProgram(program.program); current = program }
             applyBlend(item.blendMode)
-            encode(item)
+            encode(item, batchStart[b], batchCount[b], program)
         }
 
         gl.depthMask(true)
@@ -508,6 +719,40 @@ internal class GlSceneBackend private constructor(
         if (scissored) gl.disable(GlConst.SCISSOR_TEST)
     }
 
+
+    private fun needsFull(item: DrawItem) = item.waterShade > 0f || item.isVortex || item.isFoam
+
+    /** Per-pane uniforms for [p] (which must be in use). The lite program takes fog distances / 1024. */
+    private fun frameUniforms(p: SceneProgram, source: GpuSceneFrame) {
+        gl.uniformMatrix4(p.viewProjection, viewProjectionMatrix)
+        gl.uniformMatrix4(p.lightViewProjection, lightViewProjectionMatrix)
+        gl.uniform4(p.cameraPosition, frame.cameraPosition.x, frame.cameraPosition.y, frame.cameraPosition.z, 0f)
+        val k = frame.keyDirection; val kl = 1f / sqrt(k.x * k.x + k.y * k.y + k.z * k.z).coerceAtLeast(1e-6f)
+        val f = frame.fillDirection; val fl = 1f / sqrt(f.x * f.x + f.y * f.y + f.z * f.z).coerceAtLeast(1e-6f)
+        gl.uniform4(p.lightDirection, k.x * kl, k.y * kl, k.z * kl, 0f)
+        gl.uniform4(p.lightColor, frame.keyRed, frame.keyGreen, frame.keyBlue, 1f)
+        gl.uniform4(p.fillDirection, f.x * fl, f.y * fl, f.z * fl, 0f)
+        gl.uniform4(p.fillColor, frame.fillRed, frame.fillGreen, frame.fillBlue, 1f)
+        gl.uniform4(p.ambientColor, frame.ambientRed, frame.ambientGreen, frame.ambientBlue, 1f)
+        gl.uniform4(p.fogColor, frame.fogRed, frame.fogGreen, frame.fogBlue, 1f)
+        val fogScale = if (p.lite) 1f / 1024f else 1f
+        gl.uniform4(p.fogParams, frame.fogStart * fogScale, frame.fogEnd * fogScale, FOG_MAX_DENSITY, 0f)
+        gl.uniform4(p.shadowParams, 1f / SHADOW_MAP_SIZE.toFloat(), SHADOW_DEPTH_BIAS, frame.shadowStrength, EXPOSURE)
+        gl.uniform4(p.grade, frame.saturation, frame.contrast, frame.emissiveFogResistance, 0f)
+        if (p.shadowMap >= 0) {
+            gl.activeTexture(GlConst.TEXTURE0 + UNIT_SHADOW)
+            gl.bindTexture(GlConst.TEXTURE_2D, shadowTexture)
+            gl.uniform1i(p.shadowMap, UNIT_SHADOW)
+            gl.activeTexture(GlConst.TEXTURE0 + UNIT_ALBEDO)
+            boundAlbedo = -1
+        }
+        gl.uniform1i(p.albedo, UNIT_ALBEDO)
+        if (!p.lite) {
+            gl.uniform1f(p.time, frame.timeSeconds)
+            uploadWaterUniforms(source.water, frame.timeSeconds)
+            uploadVortexUniforms(source.vortex, source.vortexSurge)
+        }
+    }
 
     private fun uploadWaterUniforms(water: WaterConfig, timeSeconds: Float) {
         water.packSwell(swellScratch, timeSeconds)
@@ -574,24 +819,100 @@ internal class GlSceneBackend private constructor(
         )
     }
 
-    private fun encode(item: DrawItem) {
+    private var opaqueBatches = 0
+    private var instanceFloats = 0
+
+    /** Groups this pane's visible draws into batches and writes their instance records. Returns the batch count. */
+    private fun buildBatches(): Int {
+        batchFirst.clear()
+        additiveDraws.clear()
+        instanceFloats = 0
+        var batches = 0
+        fun begin(item: DrawItem) {
+            batchFirst.add(item)
+            batchStart[batches] = instanceFloats / FLOATS_PER_INSTANCE
+            batchCount[batches] = 0
+            batches++
+        }
+        fun add(item: DrawItem) {
+            writeInstance(item)
+            batchCount[batches - 1]++
+        }
+        fun runs(items: List<DrawItem>) {
+            var last: DrawItem? = null
+            for (item in items) {
+                if (!item.inView) continue
+                if (last == null || !last.batchesWith(item)) {
+                    if (batches == batchStart.size) return
+                    begin(item)
+                }
+                add(item)
+                last = item
+            }
+        }
+        if (opaqueDraws.size > 1) opaqueDraws.sortWith(byBatchKey)
+        runs(opaqueDraws)
+        opaqueBatches = batches
+        // Alpha keeps its far-to-near order; additive is pulled out and grouped.
+        var last: DrawItem? = null
+        for (item in blendedDraws) {
+            if (!item.inView) continue
+            if (item.blendMode == GpuBlendMode.Additive) { additiveDraws.add(item); continue }
+            if (last == null || !last.batchesWith(item)) { if (batches == batchStart.size) break; begin(item) }
+            add(item)
+            last = item
+        }
+        if (additiveDraws.size > 1) additiveDraws.sortWith(byBatchKey)
+        runs(additiveDraws)
+        return batches
+    }
+
+    private fun writeInstance(item: DrawItem) {
+        if (instanceFloats + FLOATS_PER_INSTANCE > instanceData.size) instanceData = instanceData.copyOf(instanceData.size * 2)
+        val d = instanceData
+        var o = instanceFloats
+        item.model.copyInto(d, o, 0, 16); o += 16
+        val n = item.normal
+        d[o] = n[0]; d[o + 1] = n[1]; d[o + 2] = n[2]; d[o + 3] = 0f
+        d[o + 4] = n[4]; d[o + 5] = n[5]; d[o + 6] = n[6]; d[o + 7] = 0f
+        d[o + 8] = n[8]; d[o + 9] = n[9]; d[o + 10] = n[10]; d[o + 11] = 0f
+        o += 12
+        d[o] = item.tintRed; d[o + 1] = item.tintGreen; d[o + 2] = item.tintBlue; d[o + 3] = item.opacity
+        instanceFloats += FLOATS_PER_INSTANCE
+    }
+
+    private fun uploadInstances() {
+        gl.bindBuffer(GlConst.ARRAY_BUFFER, instanceBuffer)
+        val bytes = maxOf(instanceFloats * 4, INSTANCE_STRIDE_BYTES)
+        // Orphan the previous pane's storage (no stall waiting for its draws), then one upload.
+        if (bytes > instanceCapacityBytes) ensureInstanceCapacity(bytes)
+        else gl.bufferStorage(GlConst.ARRAY_BUFFER, instanceCapacityBytes, GlConst.STREAM_DRAW)
+        if (instanceFloats > 0) gl.bufferSubData(GlConst.ARRAY_BUFFER, 0, instanceData, instanceFloats)
+    }
+
+    private fun encode(item: DrawItem, firstInstance: Int, instances: Int, p: SceneProgram) {
         val mesh = item.mesh ?: return
         applyCull(item.cullMode)
         bindAlbedo(item.albedoTexture)
         bindMesh(mesh)
-        gl.uniformMatrix4(scene.model, item.model)
-        gl.uniformMatrix4(scene.normalMatrix, item.normal)
-        gl.uniform4(scene.baseColor, item.red, item.green, item.blue, item.alpha)
-        gl.uniform4(scene.emissive, item.emissiveRed, item.emissiveGreen, item.emissiveBlue, if (item.isBubble) 1f else 0f)
-        gl.uniform4(
-            scene.materialParams,
-            item.roughness, item.metallic, item.receivesShadow,
-            if (item.albedoTexture != 0) 1f else 0f,
-        )
-        gl.uniform1f(scene.waterShade, item.waterShade)
-        gl.uniform1f(scene.vortex, if (item.isVortex) 1f else 0f)
-        gl.uniform2(scene.foam, if (item.isFoam) 1f else 0f, item.foamAge)
-        gl.drawElements(GlConst.TRIANGLES, item.indexCount, GlConst.UNSIGNED_INT, item.firstIndex * 4)
+        gl.bindBuffer(GlConst.ARRAY_BUFFER, instanceBuffer)
+        pointInstances(firstInstance * INSTANCE_STRIDE_BYTES)
+        // Material uniforms only when they change (consecutive batches often share them).
+        p.set4(gl, p.baseColor, 0, item.red, item.green, item.blue, item.alpha)
+        p.set4(gl, p.emissive, 1, item.emissiveRed, item.emissiveGreen, item.emissiveBlue, if (item.isBubble) 1f else 0f)
+        p.set4(gl, p.emissiveMode, 2, if (item.emissiveFromVertexColor) 1f else 0f, if (item.emissiveFromAlbedo) 1f else 0f,
+            if (item.emissiveMask) 1f else 0f, 0f)
+        p.set4(gl, p.materialParams, 3, item.roughness, item.metallic, item.receivesShadow, if (item.albedoTexture != 0) 1f else 0f)
+        if (!p.lite) {
+            gl.uniform1f(p.waterShade, item.waterShade)
+            gl.uniform1f(p.vortex, if (item.isVortex) 1f else 0f)
+            gl.uniform2(p.foam, if (item.isFoam) 1f else 0f, item.foamAge)
+        }
+        gl.drawElementsInstanced(GlConst.TRIANGLES, item.indexCount, GlConst.UNSIGNED_INT, item.firstIndex * 4, instances)
+        statDrawCalls++
+        if (p.lite) statLiteDraws++
+        statInstancesBatched += instances
+        statTriangles += item.indexCount / 3 * instances
     }
 
     private fun bindMesh(mesh: GlMesh) = bindVertexArray(mesh.vertexArray)
@@ -649,19 +970,31 @@ internal class GlSceneBackend private constructor(
         assets?.let(::release)
         assets = null
         gl.deleteProgram(scene.program)
+        litePlain?.let { gl.deleteProgram(it.program) }
+        liteShadow?.let { gl.deleteProgram(it.program) }
         gl.deleteProgram(shadow.program)
         gl.deleteProgram(sky.program)
         gl.deleteVertexArray(sky.emptyVertexArray)
-        gl.deleteFramebuffer(shadowFramebuffer)
-        gl.deleteTexture(shadowTexture)
+        if (shadowFramebuffer != 0) gl.deleteFramebuffer(shadowFramebuffer)
+        if (shadowTexture != 0) gl.deleteTexture(shadowTexture)
         gl.deleteTexture(whiteTexture)
+        gl.deleteBuffer(instanceBuffer)
     }
 
-    internal class SceneProgram(val program: Int, gl: GlApi) {
+    internal class SceneProgram(val program: Int, gl: GlApi, val lite: Boolean = false) {
+        private val cache = FloatArray(4 * 4) { Float.NaN }
+
+        /** Sets a vec4 uniform unless slot [slot] of the cache already holds exactly these values. */
+        fun set4(gl: GlApi, location: Int, slot: Int, x: Float, y: Float, z: Float, w: Float) {
+            val o = slot * 4
+            if (cache[o] == x && cache[o + 1] == y && cache[o + 2] == z && cache[o + 3] == w) return
+            cache[o] = x; cache[o + 1] = y; cache[o + 2] = z; cache[o + 3] = w
+            gl.uniform4(location, x, y, z, w)
+        }
+
         val viewProjection = gl.uniformLocation(program, "uViewProjection")
         val lightViewProjection = gl.uniformLocation(program, "uLightViewProjection")
-        val model = gl.uniformLocation(program, "uModel")
-        val normalMatrix = gl.uniformLocation(program, "uNormalMatrix")
+        val grade = gl.uniformLocation(program, "uGrade")
         val cameraPosition = gl.uniformLocation(program, "uCameraPosition")
         val lightDirection = gl.uniformLocation(program, "uLightDirection")
         val lightColor = gl.uniformLocation(program, "uLightColor")
@@ -674,6 +1007,7 @@ internal class GlSceneBackend private constructor(
         val baseColor = gl.uniformLocation(program, "uBaseColor")
         val emissive = gl.uniformLocation(program, "uEmissive")
         val materialParams = gl.uniformLocation(program, "uMaterialParams")
+        val emissiveMode = gl.uniformLocation(program, "uEmissiveMode")
         val shadowMap = gl.uniformLocation(program, "uShadowMap")
         val albedo = gl.uniformLocation(program, "uAlbedo")
 
@@ -711,6 +1045,12 @@ internal class GlSceneBackend private constructor(
         val zenithColor = gl.uniformLocation(program, "uZenithColor")
         val horizonColor = gl.uniformLocation(program, "uHorizonColor")
         val cloudColor = gl.uniformLocation(program, "uCloudColor")
+        val moon = gl.uniformLocation(program, "uMoon")
+        val moonColor = gl.uniformLocation(program, "uMoonColor")
+        val stars = gl.uniformLocation(program, "uStars")
+        val skyline = gl.uniformLocation(program, "uSkyline")
+        val skylineColor = gl.uniformLocation(program, "uSkylineColor")
+        val skylineLights = gl.uniformLocation(program, "uSkylineLights")
     }
 
     companion object {
@@ -730,9 +1070,6 @@ internal class GlSceneBackend private constructor(
 
         private const val SHADOW_SLOPE_BIAS = 2.5f
 
-        private val SKY_ZENITH = PackedColor(0xff4bb8f8.toInt())
-        private val SKY_HORIZON = PackedColor(0xffeaf8ff.toInt())
-        private val SKY_CLOUD = PackedColor(0xfffdfeff.toInt())
 
         private val IDENTITY_TRANSFORM = Transform3D()
 
@@ -743,6 +1080,11 @@ internal class GlSceneBackend private constructor(
                 GlShaders.sceneVertex(dialect),
                 GlShaders.sceneFragment(dialect),
             ) ?: return null
+            // Optional: if a lean variant fails to link the full program draws everything.
+            val litePlain = GlProgramBuilder.link(gl, "scene-lite",
+                GlShaders.sceneLiteVertex(dialect, shadows = false), GlShaders.sceneLiteFragment(dialect, shadows = false))
+            val liteShadow = GlProgramBuilder.link(gl, "scene-lite-shadow",
+                GlShaders.sceneLiteVertex(dialect, shadows = true), GlShaders.sceneLiteFragment(dialect, shadows = true))
             val shadowProgram = GlProgramBuilder.link(
                 gl, "shadow",
                 GlShaders.shadowVertex(dialect),
@@ -761,31 +1103,6 @@ internal class GlSceneBackend private constructor(
                 return null
             }
 
-            val shadowTexture = gl.genTexture()
-            gl.bindTexture(GlConst.TEXTURE_2D, shadowTexture)
-            gl.texImage2DDepth(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE)
-            gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_MIN_FILTER, GlConst.LINEAR)
-            gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_MAG_FILTER, GlConst.LINEAR)
-            gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_WRAP_S, GlConst.CLAMP_TO_EDGE)
-            gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_WRAP_T, GlConst.CLAMP_TO_EDGE)
-            gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_COMPARE_MODE, GlConst.COMPARE_REF_TO_TEXTURE)
-            gl.texParameteri(GlConst.TEXTURE_2D, GlConst.TEXTURE_COMPARE_FUNC, GlConst.LESS)
-
-            val framebuffer = gl.genFramebuffer()
-            gl.bindFramebuffer(framebuffer)
-            gl.framebufferDepthTexture(shadowTexture)
-            gl.disableColorBuffers()
-            val complete = gl.framebufferComplete()
-            gl.bindFramebuffer(0)
-            if (!complete) {
-                println("GL: shadow framebuffer incomplete; falling back to the software renderer")
-                gl.deleteProgram(sceneProgram)
-                gl.deleteProgram(shadowProgram)
-                gl.deleteProgram(skyProgram)
-                gl.deleteFramebuffer(framebuffer)
-                gl.deleteTexture(shadowTexture)
-                return null
-            }
             val white = gl.genTexture()
             gl.bindTexture(GlConst.TEXTURE_2D, white)
             gl.texImage2DRgba(1, 1, ByteArray(4) { 0xFF.toByte() })
@@ -797,11 +1114,12 @@ internal class GlSceneBackend private constructor(
             return GlSceneBackend(
                 gl = gl,
                 scene = SceneProgram(sceneProgram, gl),
+                litePlain = litePlain?.let { SceneProgram(it, gl, lite = true) },
+                liteShadow = liteShadow?.let { SceneProgram(it, gl, lite = true) },
                 shadow = ShadowProgram(shadowProgram, gl),
                 sky = SkyProgram(skyProgram, gl.genVertexArray(), gl),
-                shadowFramebuffer = framebuffer,
-                shadowTexture = shadowTexture,
                 whiteTexture = white,
+                instanceBuffer = gl.genBuffer(),
             )
         }
     }
@@ -817,6 +1135,9 @@ private class FrameState {
     var fogRed = 0f; var fogGreen = 0f; var fogBlue = 0f
     var fogStart = 0f
     var fogEnd = 1f
+    var saturation = 1.24f
+    var contrast = 0.20f
+    var emissiveFogResistance = 0f
     var shadowStrength = 0f
     var skyForward = Vec3(0f, 0f, -1f)
     var skyRight = Vec3(1f, 0f, 0f)
@@ -870,10 +1191,31 @@ private class DrawItem {
     var isVortex = false
     var isFoam = false
     var isBubble = false
+    var emissiveFromVertexColor = false
+    var emissiveFromAlbedo = false
+    var emissiveMask = false
     var foamAge = 0f
+    var tintRed = 1f
+    var tintGreen = 1f
+    var tintBlue = 1f
+    /** The instance's opacity (the material's own alpha stays in the base colour). */
+    var opacity = 1f
+    var hitFlash = 0f
+    var material: GpuMaterial? = null
+    /** Groups draws that can share one instanced draw (see [batchesWith]); equal keys are only a hint. */
+    var batchKey = 0L
 
     var inView = true
+    var isStatic = false
     var sortDepth = 0f
+
+    fun setTint(color: PackedColor) { tintRed = color.red; tintGreen = color.green; tintBlue = color.blue }
+
+    /** Same mesh range, material and render state: one instanced draw can carry both. */
+    fun batchesWith(other: DrawItem): Boolean =
+        mesh === other.mesh && firstIndex == other.firstIndex && indexCount == other.indexCount &&
+            material === other.material && albedoTexture == other.albedoTexture && blendMode == other.blendMode &&
+            hitFlash == 0f && other.hitFlash == 0f && !isFoam && !isVortex && waterShade == 0f && !isBubble
 
     fun fill(
         mesh: GlMesh,
@@ -894,7 +1236,11 @@ private class DrawItem {
         red = source.red + (1f - source.red) * hitFlash
         green = source.green + (1f - source.green) * hitFlash
         blue = source.blue + (1f - source.blue) * hitFlash
-        alpha = (source.alpha * opacity).coerceIn(0f, 1f)
+        this.hitFlash = hitFlash
+        this.opacity = opacity
+        this.material = material
+        val combined = (source.alpha * opacity).coerceIn(0f, 1f)
+        alpha = source.alpha
 
         val emissive = material.emissive
         val strength = material.emissiveStrength
@@ -907,7 +1253,7 @@ private class DrawItem {
         metallic = material.metallic
         receivesShadow = if (strength > 0.001f) 0f else 1f
         cullMode = material.cullMode
-        blendMode = if (alpha < 0.995f) {
+        blendMode = if (combined < 0.995f) {
             if (material.blendMode == GpuBlendMode.Additive) GpuBlendMode.Additive else GpuBlendMode.Alpha
         } else {
             material.blendMode
@@ -918,6 +1264,11 @@ private class DrawItem {
         isVortex = material.isVortex
         isFoam = material.isFoam
         isBubble = material.isBubble
+        emissiveFromVertexColor = material.emissiveFromVertexColor
+        emissiveFromAlbedo = material.emissiveFromAlbedo && albedoTexture != 0
+        emissiveMask = material.emissiveMaskFromVertexAlpha
+        batchKey = (mesh.vertexArray.toLong() shl 40) xor (firstIndex.toLong() shl 20) xor
+            (material.id.hashCode().toLong() and 0xfffff) xor (blendMode.ordinal.toLong() shl 62)
     }
 }
 

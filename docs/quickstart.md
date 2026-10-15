@@ -207,6 +207,34 @@ Text(pacing.report.toString())        // "59.8 fps · 0.4% late · p99 16.7 ms �
 
 Measure release builds: debug builds are dominated by JIT and debuggable overhead.
 
+## Phones as controllers
+
+```kotlin
+val phones = PhonePads(files = bundledPhonePadFiles() ?: PhonePadFiles.Lite, secure = true)  // https: tilt works
+phones.start()                                   // off the UI thread; false without a network
+val qr = phones.url?.let { QrCode.encode(it) }   // draw qr[x, y] modules for "scan to play"
+val pads = PlatformGamepad.pollAll() + phones.pollAll()   // phones are ConnectedGamepads
+phones.show(pad.id, PhonePadInfo("P2", color, PhoneLayout.DRIVE, "3RD · LAP 2/3"))
+phones.rumble(pad.id, 120, 1f)
+phones.close()
+```
+
+With `secure = true` the phone gets one "connection not private" warning the first time (a
+self-signed certificate made on the device and kept); browsers allow tilt only on secure pages. Safari,
+which will not open a WebSocket to such a certificate, falls back to plain HTTP on the next port.
+
+The phone page is Joyframe's `PhonePadController` (`TouchSteer`, buttons, optional tilt) built by
+the `phonepad` module (`./gradlew :phonepad:wasmJsBrowserDistribution`). Copy
+`phonepad/build/dist/wasmJs/productionExecutable` (gzip the `.wasm` and `.js` as `<name>.gzip`) into
+your Android assets or desktop resources under `phonepad/`. Without it, phones get the light HTML page.
+Android needs `<uses-permission android:name="android.permission.INTERNET" />`.
+
+## Touch steering without looking
+
+```kotlin
+TouchSteer(input, Modifier.fillMaxSize())   // touch anywhere, slide sideways; writes input.touchMovement.x
+```
+
 ## Tilt steering
 
 ```kotlin

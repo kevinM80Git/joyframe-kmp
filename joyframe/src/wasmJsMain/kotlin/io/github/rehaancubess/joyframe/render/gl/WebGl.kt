@@ -183,7 +183,13 @@ internal class WebGl(private val gl: WebGL2) : GlApi {
     override fun drawElements(mode: Int, count: Int, type: Int, offsetBytes: Int) =
         gl.drawElements(mode, count, type, offsetBytes)
 
+    override fun drawElementsInstanced(mode: Int, count: Int, type: Int, offsetBytes: Int, instances: Int) =
+        gl.drawElementsInstanced(mode, count, type, offsetBytes, instances)
+
+    override fun vertexAttribDivisor(index: Int, divisor: Int) = gl.vertexAttribDivisor(index, divisor)
+
     override fun drawArrays(mode: Int, first: Int, count: Int) = gl.drawArrays(mode, first, count)
+    override fun finish() = gl.finish()
 }
 
 private class GlObjects<T : JsAny> {
@@ -310,7 +316,10 @@ internal external interface WebGL2 : JsAny {
     fun deleteFramebuffer(framebuffer: WebGlFramebuffer?)
 
     fun drawElements(mode: Int, count: Int, type: Int, offsetBytes: Int)
+    fun drawElementsInstanced(mode: Int, count: Int, type: Int, offsetBytes: Int, instances: Int)
+    fun vertexAttribDivisor(index: Int, divisor: Int)
     fun drawArrays(mode: Int, first: Int, count: Int)
+    fun finish()
 }
 
 internal fun webGl2Context(canvas: HTMLCanvasElement, antialias: Boolean): WebGL2? = js(

@@ -1,5 +1,23 @@
 # Verification
 
+## Unreleased — phone pads over HTTPS, TouchSteer, tilt smoothing (RIFT RUSH Phase 14)
+
+Checked on 14 October 2026, macOS / JDK 17, in RIFT RUSH:
+
+- 77 desktop library tests passed, among them a real TLS socket (a client that accepts the
+  self-signed certificate: the page, a phone over `wss:`, the plain twin on the next port), the
+  certificate's checks (self-signed signature verifies, serverAuth, not a CA, under 825 days) and its
+  keeping (the same certificate for the same address, a new one for a new address or near expiry),
+  and the tilt low-pass. The library compiled for desktop, Android and Wasm; `phonepad` for Wasm.
+  iOS was not compiled this time.
+- Fire TV Stick (AFTSSS, PowerVR GE8300): the log said `4x MSAA` (the library build granted the
+  config). The server came up at `https://<stick>:47800/`; `openssl s_client` saw TLS 1.2
+  ECDHE-ECDSA-AES128-GCM-SHA256 and a certificate with the stick's IP, serverAuth, valid to 2028. A
+  desktop Chromium on the plain twin (`:47801`) loaded the Compose page, joined, started a race and
+  steered the car with `TouchSteer` (round trip 7-12 ms). The embedded browser refused the
+  self-signed page, so the HTTPS page itself, tilt and the Safari fallback are untested in a real
+  phone browser.
+
 ## Unreleased — Android 4x MSAA
 
 Checked on 9 October 2026, macOS / JDK 17:
@@ -12,6 +30,41 @@ Checked on 9 October 2026, macOS / JDK 17:
   as without MSAA, and screenshots showed smooth edges where they had been stair-stepped. That run used
   an app-side GLSurfaceView with this same config chooser around Joyframe's renderer; the library
   build with the change compiled but has not itself been run on the device.
+
+## Unreleased — frame limiter, render diagnostics, sky settings
+
+Phone controllers, 9 October 2026 (macOS 26.6 host, Kotlin 2.3.20):
+
+- 74 desktop tests passed, including `QrCodeTest` (Reed–Solomon codewords match the ISO/IEC 18004
+  Annex I example; format bits read back; version 3 for a LAN URL, 10 at 200 bytes) and
+  `PhonePadsTest` (through a real socket: the page, the RFC 6455 handshake with its example key,
+  input in, a tap released before the poll seen once, info / vibration / pong out, a reconnect keeping
+  the pad id and its info).
+- QR codes of versions 1, 3, 8 and 10, and the codes in 1280×720 game screenshots, decoded correctly
+  with macOS Core Image's QR detector.
+- Desktop, Android Debug, Kotlin/Wasm and iOS simulator ARM64 compilation passed.
+- On a Fire TV Stick 4K (2nd gen, Fire OS 8) inside RIFT RUSH: the server started on the LAN address;
+  a desktop Chrome (152) acted as the phone over Wi-Fi: the Compose controller (`phonepad`, 3.7 MB
+  gzipped, the largest file served in 0.49 s) loaded, joined, picked the menus, raced; round trips
+  7–34 ms. No physical phone (Android or iPhone) has been tried yet; vibration and tilt are untested.
+
+Local checks on 8 October 2026, macOS 26.6 (Apple Silicon) / JDK 21 host with a Gradle-provisioned
+JDK 17 toolchain / Kotlin 2.3.20:
+
+- **58 desktop-executed tests passed** (including 7 new: `FrameRateLimiter` cadence at 60/50/120 Hz,
+  vsync jitter, stall recovery, invalid rates, sky defaults), none skipped or failing.
+- Desktop, Android Debug, Kotlin/Wasm and iOS simulator ARM64 compilation passed.
+- GL render path exercised through a consumer game (RIFT RUSH Phase 1) on macOS: `OffscreenRenderer`
+  stills with 1, 2 and 4 panes and a night sky (`skySun = 0`, `skyClouds = 0`); `RenderDiagnostics`
+  reported draw calls, triangles and frustum-culled instances consistent with the scene.
+- The edited Metal sky shader was compiled only as a Kotlin string; it was not run on an iOS device
+  or simulator. Metal does not report `RenderDiagnostics` yet.
+- The Android L2/R2 change compiled; it was not tried with a physical pad.
+- Vertex colours (8 October 2026): 64 desktop tests passed (including 3 new in `VertexColorTest`:
+  optional colours, colour-count validation, emissive modes off by default). The GL path was exercised through RIFT RUSH Phase 3: a whole city drawn from four
+  vertex-coloured materials, with per-vertex emissive neon and an emissive glyph atlas, in offscreen
+  stills and live 1- and 4-pane runs. The Metal shader change compiled as a Kotlin string only (no
+  Metal toolchain on the host); it was not run on an iOS device or simulator.
 
 ## Alpha04 — smooth-by-default views and tilt
 
@@ -140,3 +193,22 @@ Local macOS packaging used the installed Homebrew JDK with
 Before a stable release, run the independent sample on Android, iOS, macOS,
 Windows/Linux and browsers with real controllers, and record exact versions and
 outcomes here. Do not substitute the original private app's results.
+
+## Fire TV performance pass (RIFT RUSH Phase 11, 2026-10-09)
+
+Hardware: Amazon Fire TV Stick 4K (2nd gen) AFTMA08C15, Fire OS 8 (Android 11, API 30), MediaTek
+MT8696 (4× Cortex-A55 1.7 GHz), PowerVR Rogue GE9215 (GLES 3.2, no timer queries), 1.7 GB RAM,
+1920×1080 UI on a 4K panel. Release build of RIFT RUSH sideloaded over adb; numbers from the game's
+RIFTDIAG log (5 s windows), `top -H`, `dumpsys gfxinfo` and `dumpsys meminfo`.
+
+Verified on that device:
+- The lean scene program links and draws every RIFT RUSH material (lite draw count = draw count);
+  GPU wait after submit 35 → 27 ms for one full-screen pane at render scale 0.75; screenshots show no
+  mediump artifacts (fog, specular, glow).
+- The software loop mixer plays 18 voices continuously; thread CPU as in the changelog. Audibility was
+  not judged by ear in this session.
+- Lazy shadow map: graphics memory 98 → 81 MB in a scene without a shadow-casting light.
+
+Verified on desktop (macOS, GL 3.3 core): lean vs full program renders are identical (mean pixel
+difference 0.00 over 31 frames); `LoopMixerTest` covers resampling, pan, gain ramps and stop.
+

@@ -19,6 +19,8 @@ class PcmSound(samples: ShortArray) {
     init { require(samples.isNotEmpty()) }
     internal val wav = Wav.encode(samples.copyOf())
     val sampleCount: Int = samples.size
+    /** The sound as a 16-bit mono WAV file (a copy): save generated audio, or inspect it in tests. */
+    fun toWav(): ByteArray = wav.copyOf()
     val durationSeconds: Float get() = sampleCount / Wav.SAMPLE_RATE.toFloat()
     companion object {
         /** Read a RIFF/WAVE asset: PCM16 mono/stereo at 44.1 kHz. Stereo is mixed to mono. */

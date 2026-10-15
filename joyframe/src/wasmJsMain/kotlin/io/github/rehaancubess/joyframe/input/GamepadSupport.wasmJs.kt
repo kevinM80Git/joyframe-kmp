@@ -105,6 +105,19 @@ actual object PlatformGamepad {
         runCatching { vibrate(pad, durationMs.coerceIn(1, 5_000), intensity.coerceIn(0f, 1f)) }
     }
 
+    actual fun rumble(controllerId: String, durationMs: Int, intensity: Float) {
+        if (!GamepadTuning.current.gamepadRumbleEnabled) return
+        val index = controllerId.removePrefix("web-").toIntOrNull() ?: return
+        val pads = connectedGamepads()
+        for (i in 0 until padCount(pads)) {
+            val pad = padAt(pads, i)
+            if (gamepadIndex(pad) == index) {
+                runCatching { vibrate(pad, durationMs.coerceIn(1, 5_000), intensity.coerceIn(0f, 1f)) }
+                return
+            }
+        }
+    }
+
     private fun trigger(value: Float): Float = if (value < TRIGGER_DEADZONE) 0f else value
 }
 

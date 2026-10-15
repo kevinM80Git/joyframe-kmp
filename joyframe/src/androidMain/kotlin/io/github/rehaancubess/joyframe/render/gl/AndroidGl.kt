@@ -207,8 +207,14 @@ internal class AndroidGl : GlApi {
         GLES30.glReadBuffer(GLES30.GL_NONE)
     }
 
+    override fun drawElementsInstanced(mode: Int, count: Int, type: Int, offsetBytes: Int, instances: Int) =
+        GLES30.glDrawElementsInstanced(mode, count, type, offsetBytes, instances)
+
+    override fun vertexAttribDivisor(index: Int, divisor: Int) = GLES30.glVertexAttribDivisor(index, divisor)
+
     override fun drawElements(mode: Int, count: Int, type: Int, offsetBytes: Int) =
         GLES20.glDrawElements(mode, count, type, offsetBytes)
 
     override fun drawArrays(mode: Int, first: Int, count: Int) = GLES30.glDrawArrays(mode, first, count)
+    override fun finish() = GLES30.glFinish()
 }
